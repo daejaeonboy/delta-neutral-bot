@@ -288,3 +288,36 @@ export const fetchTopVolumeFunding = async (
         throw new Error(`상위 거래량/펀딩 데이터 조회 실패: ${message}`);
     }
 };
+
+// ──────────────────── Multi-coin Premium ────────────────────
+
+export interface MultiPremiumCoin {
+    symbol: string;
+    krwPrice: number;
+    usdtPrice: number;
+    volume24hKrw: number;
+    premiumUsd: number;
+    premiumUsdt: number;
+}
+
+export interface MultiPremiumResponse {
+    timestamp: number;
+    usdKrw: number;
+    usdtKrw: number;
+    usdtPremiumPercent: number;
+    fxSource: string;
+    count: number;
+    coins: MultiPremiumCoin[];
+}
+
+export const fetchMultiPremium = async (limit = 20): Promise<MultiPremiumResponse> => {
+    const url = `${apiBaseUrl}/api/multi-premium?limit=${limit}`;
+    const resp = await fetch(url, {
+        signal: AbortSignal.timeout(15_000),
+        headers: { Accept: 'application/json' },
+    });
+    if (!resp.ok) throw new Error(`Multi-premium API error: ${resp.status}`);
+    const data = await resp.json();
+    if (!Array.isArray(data?.coins)) throw new Error('Invalid multi-premium response');
+    return data as MultiPremiumResponse;
+};

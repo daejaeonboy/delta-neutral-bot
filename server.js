@@ -1079,6 +1079,114 @@ app.get('/api/top-volume-funding', async (req, res) => {
     }
 });
 
+// ──────────────────── Multi-coin Premium ────────────────────
+
+const MULTI_PREMIUM_COINS = [
+    'BTC', 'ETH', 'XRP', 'SOL', 'DOGE', 'ADA', 'AVAX', 'LINK',
+    'DOT', 'MATIC', 'NEAR', 'ATOM', 'APT', 'ARB', 'OP',
+    'SUI', 'SEI', 'TIA', 'AAVE', 'UNI', 'SAND', 'MANA',
+    'SHIB', 'PEPE', 'EOS', 'TRX', 'BCH', 'LTC', 'ETC', 'FIL',
+];
+
+app.get('/api/multi-premium', async (req, res) => {
+    try {
+        const limit = parseLimit(req.query.limit, 20, 30);
+
+        // Step 1: Get available Upbit KRW markets
+        const allMarkets = await fetchJson('https://api.upbit.com/v1/market/all?isDetails=false');
+        if (!Array.isArray(allMarkets)) throw new Error('Cannot fetch Upbit markets');
+
+        const krwSet = new Set(allMarkets
+            .filter((m) => typeof m?.market === 'string' && m.market.startsWith('KRW-'))
+            .map((m) => m.market.replace('KRW-', '')));
+
+        // Step 2: Filter target coins to only valid Upbit markets
+        const validCoins = MULTI_PREMIUM_COINS.filter((s) => krwSet.has(s));
+        const upbitMarkets = [...validCoins.map((s) => `KRW-${s}`), 'KRW-USDT'].join(',');
+
+        const [upbitData, okxData, fxRate] = await Promise.all([
+            fetchJson(`https://api.upbit.com/v1/ticker?markets=${upbitMarkets}`),
+            fetchJson('https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
+            getUsdKrwRate(),
+        ]);
+
+        if (!Array.isArray(upbitData)) throw new Error('Invalid Upbit multi-ticker response');
+        if (!Array.isArray(okxData?.data)) throw new Error('Invalid OKX spot tickers response');
+
+        // Parse Upbit prices
+        const upbitMap = new Map();
+        let usdtKrw = 0;
+        for (const item of upbitData) {
+            const market = typeof item?.market === 'string' ? item.market : '';
+            const price = toFiniteNumber(item?.trade_price);
+            const volume = toFiniteNumber(item?.acc_trade_price_24h);
+            if (!market || !Number.isFinite(price) || price <= 0) continue;
+
+            if (market === 'KRW-USDT') {
+                usdtKrw = price;
+            } else {
+                const symbol = market.replace('KRW-', '');
+                upbitMap.set(symbol, { krwPrice: price, volume24hKrw: volume || 0 });
+            }
+        }
+
+        // Parse OKX USDT spot prices
+        const okxMap = new Map();
+        for (const item of okxData.data) {
+            const instId = typeof item?.instId === 'string' ? item.instId : '';
+            if (!instId.endsWith('-USDT')) continue;
+            const symbol = instId.replace('-USDT', '');
+            const price = toFiniteNumber(item?.last);
+            if (Number.isFinite(price) && price > 0) {
+                okxMap.set(symbol, price);
+            }
+        }
+
+        const usdKrw = fxRate.usdKrw;
+        const effectiveUsdtKrw = usdtKrw > 0 ? usdtKrw : usdKrw;
+        const usdtPremiumPercent = usdtKrw > 0 ? ((usdtKrw / usdKrw) - 1) * 100 : 0;
+
+        // Calculate premiums for each matched coin
+        const coins = [];
+        for (const symbol of MULTI_PREMIUM_COINS) {
+            const upbit = upbitMap.get(symbol);
+            const globalPrice = okxMap.get(symbol);
+            if (!upbit || !globalPrice) continue;
+
+            const premiumUsd = ((upbit.krwPrice / (globalPrice * usdKrw)) - 1) * 100;
+            const premiumUsdt = ((upbit.krwPrice / (globalPrice * effectiveUsdtKrw)) - 1) * 100;
+
+            coins.push({
+                symbol,
+                krwPrice: round(upbit.krwPrice, 0),
+                usdtPrice: round(globalPrice, 6),
+                volume24hKrw: round(upbit.volume24hKrw, 0),
+                premiumUsd: round(premiumUsd, 4),
+                premiumUsdt: round(premiumUsdt, 4),
+            });
+        }
+
+        // Sort by volume descending
+        coins.sort((a, b) => b.volume24hKrw - a.volume24hKrw);
+        const result = coins.slice(0, limit);
+
+        res.json({
+            timestamp: Date.now(),
+            usdKrw: round(usdKrw, 4),
+            usdtKrw: round(effectiveUsdtKrw, 4),
+            usdtPremiumPercent: round(usdtPremiumPercent, 4),
+            fxSource: fxRate.source,
+            count: result.length,
+            coins: result,
+        });
+    } catch (error) {
+        console.error('Multi-premium fetch error:', error.message);
+        res.status(500).json({
+            error: `Failed to fetch multi-coin premiums: ${error.message}`,
+        });
+    }
+});
+
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',

@@ -5,6 +5,7 @@ import { StrategyVisualizer } from './components/StrategyVisualizer';
 import { LogPanel } from './components/LogPanel';
 import { PremiumChart } from './components/PremiumChart';
 import { TopFundingTable } from './components/TopFundingTable';
+import { MultiCoinPremiumTable } from './components/MultiCoinPremiumTable';
 import { analyzeMarketSituation } from './services/geminiService';
 import { MarketData, TradeLog, BotConfig, TradeStatus } from './types';
 import { INITIAL_CAPITAL, DEFAULT_EXCHANGE_RATE, RISKS } from './constants';
@@ -430,6 +431,8 @@ const App: React.FC = () => {
             <span>USDT/KRW: {currentData.usdtKrwRate?.toFixed(2) ?? '-'} · USD/KRW: {currentData.exchangeRate.toFixed(2)}</span>
             <span>마지막 성공 갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
           </div>
+
+          <MultiCoinPremiumTable />
 
           <TopFundingTable defaultNotionalUsdt={defaultFundingNotionalUsdt} />
 
