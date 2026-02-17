@@ -1,0 +1,35 @@
+{
+  "name": "delta-neutral-bot",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "vite --host :: --port 3000 --strictPort",
+    "dev:server": "node server.js",
+    "dev:all": "concurrently \"npm:dev:server\" \"npm:dev\"",
+    "test:api": "node scripts/api_connectivity_test.js",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@google/genai": "^1.41.0",
+    "ccxt": "^4.5.38",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
+    "lucide-react": "^0.564.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "recharts": "^3.7.0",
+    "socks-proxy-agent": "^8.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "concurrently": "^9.2.1",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
