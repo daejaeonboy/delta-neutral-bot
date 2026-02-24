@@ -1,11 +1,60 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowUpDown, RefreshCw, TrendingUp } from 'lucide-react';
 import { fetchMultiPremium, MultiPremiumCoin, MultiPremiumResponse } from '../services/marketService';
 
-type SortKey = 'symbol' | 'premiumUsd' | 'premiumUsdt' | 'volume24hKrw' | 'krwPrice';
+type SortKey = 'symbol' | 'premiumUsd' | 'premiumUsdt' | 'volume24hKrw' | 'krwPrice' | 'usdtPrice';
 type SortDir = 'asc' | 'desc';
 
 const POLL_INTERVAL_MS = 30_000;
+
+// Header Component
+export const MultiCoinPremiumHeader: React.FC = () => {
+    const [data, setData] = useState<MultiPremiumResponse | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    const loadData = useCallback(async () => {
+        try {
+            const resp = await fetchMultiPremium(1); // Fetch minimal data just for header info
+            setData(resp);
+        } catch (err) {
+            // ignore header error
+        } finally {
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        void loadData();
+        const id = window.setInterval(() => void loadData(), POLL_INTERVAL_MS);
+        return () => clearInterval(id);
+    }, [loadData]);
+
+    return (
+        <div className="flex items-center justify-between px-2 py-3 bg-slate-950/80 border-b border-slate-800">
+            <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+                <TrendingUp className="w-5 h-5 text-indigo-400" />
+                BTC 김치 프리미엄
+            </h3>
+            <div className="flex items-center gap-3">
+                {data && (
+                    <div className="flex items-center gap-3 text-[11px] text-slate-500">
+                        <span>USD/KRW: <span className="text-slate-300 font-mono">₩{data.usdKrw.toFixed(2)}</span></span>
+                        <span>USDT/KRW: <span className="text-slate-300 font-mono">₩{data.usdtKrw.toFixed(0)}</span></span>
+                        <span>USDT 프리미엄: <span className="text-amber-400 font-mono font-bold">{data.usdtPremiumPercent.toFixed(2)}%</span></span>
+                        <span>해외소스: <span className="text-slate-400 font-mono">{data.globalSource ?? 'okx:spot'}</span></span>
+                    </div>
+                )}
+                <button
+                    onClick={() => void loadData()}
+                    disabled={isLoading}
+                    className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-400 px-2.5 py-1 rounded-lg flex items-center gap-1 transition-colors"
+                >
+                    <RefreshCw size={14} className={isLoading ? 'animate-spin' : ''} />
+                </button>
+            </div>
+        </div>
+    );
+};
 
 export const MultiCoinPremiumTable: React.FC = () => {
     const [data, setData] = useState<MultiPremiumResponse | null>(null);
@@ -41,9 +90,10 @@ export const MultiCoinPremiumTable: React.FC = () => {
         }
     };
 
-    const sortedCoins: MultiPremiumCoin[] = React.useMemo(() => {
+    const sortedCoins: MultiPremiumCoin[] = useMemo(() => {
         if (!data?.coins) return [];
-        return [...data.coins].sort((a, b) => {
+        const btcOnly = data.coins.filter((coin) => isBtcSymbol(coin.symbol));
+        return [...btcOnly].sort((a, b) => {
             const av = a[sortKey];
             const bv = b[sortKey];
             if (typeof av === 'string' && typeof bv === 'string') {
@@ -80,29 +130,8 @@ export const MultiCoinPremiumTable: React.FC = () => {
     );
 
     return (
-        <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-5">
-            <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-semibold text-slate-200 flex items-center gap-2">
-                    <TrendingUp className="w-5 h-5 text-indigo-400" />
-                    멀티코인 김치 프리미엄
-                </h3>
-                <div className="flex items-center gap-3">
-                    {data && (
-                        <div className="flex items-center gap-3 text-[11px] text-slate-500">
-                            <span>USD/KRW: <span className="text-slate-300 font-mono">₩{data.usdKrw.toFixed(2)}</span></span>
-                            <span>USDT/KRW: <span className="text-slate-300 font-mono">₩{data.usdtKrw.toFixed(0)}</span></span>
-                            <span>USDT 프리미엄: <span className="text-amber-400 font-mono">{data.usdtPremiumPercent.toFixed(2)}%</span></span>
-                        </div>
-                    )}
-                    <button
-                        onClick={() => void loadData()}
-                        disabled={isLoading}
-                        className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-400 px-2.5 py-1 rounded-lg flex items-center gap-1 transition-colors"
-                    >
-                        <RefreshCw size={12} className={isLoading ? 'animate-spin' : ''} />
-                    </button>
-                </div>
-            </div>
+        <div className="p-0">
+            {/* Header moved to standalone component */}
 
             {error && (
                 <div className="text-sm text-rose-400 bg-rose-950/30 border border-rose-800/50 rounded-lg px-3 py-2 mb-3">
@@ -116,7 +145,7 @@ export const MultiCoinPremiumTable: React.FC = () => {
                         <tr className="text-slate-500 border-b border-slate-800">
                             <SortHeader label="코인" col="symbol" />
                             <SortHeader label="국내가 (KRW)" col="krwPrice" className="text-right" />
-                            <SortHeader label="해외가 (USDT)" col="krwPrice" className="text-right" />
+                            <SortHeader label="해외가 (USDT)" col="usdtPrice" className="text-right" />
                             <SortHeader label="USD 김프" col="premiumUsd" className="text-right" />
                             <SortHeader label="USDT 김프" col="premiumUsdt" className="text-right" />
                             <SortHeader label="24h 거래대금" col="volume24hKrw" className="text-right" />
@@ -167,8 +196,8 @@ export const MultiCoinPremiumTable: React.FC = () => {
             </div>
 
             {data && (
-                <div className="mt-3 text-[10px] text-slate-600 text-right">
-                    {data.count}개 코인 · 30초마다 자동 갱신 · {new Date(data.timestamp).toLocaleTimeString('ko-KR')}
+                <div className="mt-3 text-[10px] text-slate-600 text-right px-2">
+                    BTC {sortedCoins.length}건 · 30초마다 자동 갱신 · {new Date(data.timestamp).toLocaleTimeString('ko-KR')}
                 </div>
             )}
         </div>
@@ -180,4 +209,12 @@ function formatVolume(v: number): string {
     if (v >= 1e8) return `₩${(v / 1e8).toFixed(0)}억`;
     if (v >= 1e4) return `₩${(v / 1e4).toFixed(0)}만`;
     return `₩${v.toLocaleString()}`;
+}
+
+function isBtcSymbol(symbol: string): boolean {
+    const normalized = symbol.trim().toUpperCase();
+    if (!normalized) return false;
+    if (normalized === 'BTC' || normalized === 'KRW-BTC' || normalized === 'BTCUSDT') return true;
+    const compact = normalized.replace(/[^A-Z]/g, '');
+    return compact === 'BTC';
 }

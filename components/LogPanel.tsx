@@ -18,7 +18,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs }) => {
         {logs.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-slate-600">
             <Clock className="w-8 h-8 mb-2 opacity-50" />
-            <p className="text-sm">시장 진입 조건 대기 중...</p>
+            <p className="text-sm">판매 조건 대기 중...</p>
           </div>
         ) : (
           logs.map((log) => (
@@ -32,7 +32,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs }) => {
                    log.type === 'ENTRY' ? 'text-emerald-400' : 'text-indigo-400'
                 }`}>
                   {log.type === 'ENTRY' ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
-                  {log.type === 'ENTRY' ? '진입' : '청산'}
+                  {log.type === 'ENTRY' ? '판매' : '매수'}
                 </span>
                 <span className="text-slate-500 text-xs font-mono">
                   {new Date(log.timestamp).toLocaleTimeString()}

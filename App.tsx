@@ -1,58 +1,124 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Activity, Settings, Play, Pause, AlertTriangle, Zap, DollarSign, RefreshCw, MessageSquare } from 'lucide-react';
+import { Activity, Play, Pause, Zap, DollarSign, RefreshCw, TrendingUp } from 'lucide-react';
 import { MetricCard } from './components/MetricCard';
-import { StrategyVisualizer } from './components/StrategyVisualizer';
-import { LogPanel } from './components/LogPanel';
+import { MultiCoinPremiumHeader, MultiCoinPremiumTable } from './components/MultiCoinPremiumTable';
+import { BacktestPanel } from './components/BacktestPanel';
 import { PremiumChart } from './components/PremiumChart';
-import { TopFundingTable } from './components/TopFundingTable';
-import { MultiCoinPremiumTable } from './components/MultiCoinPremiumTable';
-import { analyzeMarketSituation } from './services/geminiService';
-import { MarketData, TradeLog, BotConfig, TradeStatus } from './types';
-import { INITIAL_CAPITAL, DEFAULT_EXCHANGE_RATE, RISKS } from './constants';
-import { fetchLiveMarketData } from './services/marketService';
+import {
+  ExecutionCredentialsStatusResponse,
+  ExecutionEngineReadinessResponse,
+  BinanceExecutionFill,
+  ExecutionEngineStatusResponse,
+  BinanceExecutionPortfolioResponse,
+  BinanceExecutionPositionResponse,
+  BinanceExecutionStatusResponse,
+  BotConfig,
+  ExecutionEventsResponse,
+  ExecutionMarketType,
+  ExecutionSafetyResponse,
+  MarketData,
+} from './types';
+import { INITIAL_CAPITAL, DEFAULT_EXCHANGE_RATE } from './constants';
+import {
+  clearExecutionCredentials,
+  fetchExecutionCredentialsStatus,
+  fetchExecutionEvents,
+  fetchExecutionEngineStatus,
+  fetchExecutionEngineReadiness,
+  fetchExecutionFills,
+  fetchExecutionPortfolio,
+  fetchExecutionPosition,
+  fetchExecutionSafety,
+  fetchExecutionStatus,
+  fetchLiveMarketData,
+  resetExecutionSafety,
+  startExecutionEngine,
+  stopExecutionEngine,
+  updateExecutionCredentials,
+  fetchDiscordConfig,
+  updateDiscordConfig,
+  sendDiscordTest,
+  DiscordConfigResponse,
+} from './services/marketService';
 
-const HISTORY_LIMIT = 120;
 const POLLING_INTERVAL_MS = 3000;
+const EXECUTION_REFRESH_INTERVAL_MS = 15000;
+
+type SidebarSection = 'automation' | 'portfolio' | 'backtest' | 'settings';
 
 const App: React.FC = () => {
   // --- State ---
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [marketData, setMarketData] = useState<MarketData[]>([]);
   const [currentData, setCurrentData] = useState<MarketData | null>(null);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [marketError, setMarketError] = useState<string | null>(null);
   const [lastSuccessfulFetchAt, setLastSuccessfulFetchAt] = useState<number | null>(null);
-  const [logs, setLogs] = useState<TradeLog[]>([]);
-  const [tradeStatus, setTradeStatus] = useState<TradeStatus>(TradeStatus.IDLE);
-  const [entryPriceDiff, setEntryPriceDiff] = useState<number>(0); // Record premium at entry
 
   // Bot Config
   const [config, setConfig] = useState<BotConfig>({
-    entryThreshold: 3.5,
-    exitThreshold: 0.8,
+    entryThreshold: 2.0,
+    exitThreshold: 0.0,
     leverage: 1,
     investmentKrw: INITIAL_CAPITAL
   });
 
-  // AI State
-  const [aiAdvice, setAiAdvice] = useState<string | null>(null);
-  const [isAiLoading, setIsAiLoading] = useState(false);
+  // Execution State
+  const [executionMarketType, setExecutionMarketType] = useState<ExecutionMarketType>('coinm');
+  const [executionSymbol, setExecutionSymbol] = useState<string>(defaultSymbolByMarketType('coinm'));
+  const [executionAmount, setExecutionAmount] = useState<number>(1);
+  const [executionDryRun, setExecutionDryRun] = useState<boolean>(true);
+  const [executionStatus, setExecutionStatus] = useState<BinanceExecutionStatusResponse | null>(null);
+  const [executionSafety, setExecutionSafety] = useState<ExecutionSafetyResponse | null>(null);
+  const [executionPosition, setExecutionPosition] = useState<BinanceExecutionPositionResponse | null>(null);
+  const [executionPortfolio, setExecutionPortfolio] = useState<BinanceExecutionPortfolioResponse | null>(null);
+  const [executionFills, setExecutionFills] = useState<BinanceExecutionFill[]>([]);
+  const [executionEvents, setExecutionEvents] = useState<ExecutionEventsResponse['events']>([]);
+  const [executionEngineStatus, setExecutionEngineStatus] = useState<ExecutionEngineStatusResponse | null>(null);
+  const [executionReadiness, setExecutionReadiness] = useState<ExecutionEngineReadinessResponse | null>(null);
+  const [executionCredentialsStatus, setExecutionCredentialsStatus] = useState<ExecutionCredentialsStatusResponse | null>(null);
+  const [executionApiKeyInput, setExecutionApiKeyInput] = useState<string>('');
+  const [executionApiSecretInput, setExecutionApiSecretInput] = useState<string>('');
+  const [executionCredentialPersist, setExecutionCredentialPersist] = useState<boolean>(true);
+  const [executionError, setExecutionError] = useState<string | null>(null);
+  const [isExecutionRefreshing, setIsExecutionRefreshing] = useState<boolean>(false);
+  const [isEngineSubmitting, setIsEngineSubmitting] = useState<boolean>(false);
+  const [isCredentialSubmitting, setIsCredentialSubmitting] = useState<boolean>(false);
+  const [isReadinessChecking, setIsReadinessChecking] = useState<boolean>(false);
+  const [activeSection, setActiveSection] = useState<SidebarSection>('automation');
+  // Discord state
+  const [discordConfig, setDiscordConfig] = useState<DiscordConfigResponse | null>(null);
+  const [discordWebhookInput, setDiscordWebhookInput] = useState<string>('');
+  const [isDiscordSubmitting, setIsDiscordSubmitting] = useState<boolean>(false);
+  const [discordMessage, setDiscordMessage] = useState<string | null>(null);
 
   const pollingRef = useRef<number | null>(null);
+  const executionPollingRef = useRef<number | null>(null);
+
+  function defaultSymbolByMarketType(marketType: ExecutionMarketType): string {
+    return marketType === 'usdm' ? 'BTC/USDT:USDT' : 'BTC/USD:BTC';
+  }
+
+  function formatNullableNumber(value: number | null | undefined, maximumFractionDigits = 8): string {
+    if (value == null || !Number.isFinite(value)) return '-';
+    return value.toLocaleString(undefined, { maximumFractionDigits });
+  }
+
+  function formatSignedNumber(value: number | null | undefined, maximumFractionDigits = 8): string {
+    if (value == null || !Number.isFinite(value)) return '-';
+    const absValue = Math.abs(value);
+    const body = absValue.toLocaleString(undefined, { maximumFractionDigits });
+    if (value > 0) return `+${body}`;
+    if (value < 0) return `-${body}`;
+    return body;
+  }
 
   const appendMarketDataPoint = useCallback((newDataPoint: MarketData) => {
     setCurrentData(newDataPoint);
-    setMarketData((prev) => {
-      if (prev.length > 0 && prev[prev.length - 1].timestamp === newDataPoint.timestamp) {
-        return prev;
-      }
-
-      const next = [...prev, newDataPoint];
-      if (next.length > HISTORY_LIMIT) next.shift();
-      return next;
-    });
   }, []);
+
+  useEffect(() => {
+    setExecutionSymbol(defaultSymbolByMarketType(executionMarketType));
+  }, [executionMarketType]);
 
   const refreshMarketData = useCallback(
     async (manualRefresh = false) => {
@@ -75,7 +141,106 @@ const App: React.FC = () => {
     [appendMarketDataPoint]
   );
 
-  // Always keep market feed updated, independent from bot trading status.
+  const refreshExecutionData = useCallback(
+    async (manualRefresh = false) => {
+      if (manualRefresh) setIsExecutionRefreshing(true);
+
+      const settled = await Promise.allSettled([
+        fetchExecutionStatus(executionMarketType),
+        fetchExecutionCredentialsStatus(),
+        fetchExecutionSafety(),
+        fetchExecutionPosition(executionMarketType, executionSymbol.trim()),
+        fetchExecutionPortfolio({
+          marketType: executionMarketType,
+          symbol: executionSymbol.trim(),
+          balanceLimit: 8,
+        }),
+        fetchExecutionFills({
+          marketType: executionMarketType,
+          symbol: executionSymbol.trim(),
+          limit: 20,
+        }),
+        fetchExecutionEvents({
+          limit: 30,
+          marketType: executionMarketType,
+        }),
+        fetchExecutionEngineStatus(),
+      ]);
+
+      const errors: string[] = [];
+
+      const executionStatusResult = settled[0];
+      if (executionStatusResult.status === 'fulfilled') {
+        setExecutionStatus(executionStatusResult.value);
+      } else {
+        errors.push(executionStatusResult.reason instanceof Error ? executionStatusResult.reason.message : String(executionStatusResult.reason));
+      }
+
+      const credentialsResult = settled[1];
+      if (credentialsResult.status === 'fulfilled') {
+        setExecutionCredentialsStatus(credentialsResult.value);
+      } else {
+        errors.push(credentialsResult.reason instanceof Error ? credentialsResult.reason.message : String(credentialsResult.reason));
+      }
+
+      const safetyResult = settled[2];
+      if (safetyResult.status === 'fulfilled') {
+        setExecutionSafety(safetyResult.value);
+      } else {
+        errors.push(safetyResult.reason instanceof Error ? safetyResult.reason.message : String(safetyResult.reason));
+      }
+
+      const positionResult = settled[3];
+      if (positionResult.status === 'fulfilled') {
+        setExecutionPosition(positionResult.value);
+      } else {
+        errors.push(positionResult.reason instanceof Error ? positionResult.reason.message : String(positionResult.reason));
+      }
+
+      const portfolioResult = settled[4];
+      if (portfolioResult.status === 'fulfilled') {
+        setExecutionPortfolio(portfolioResult.value);
+      } else {
+        errors.push(
+          portfolioResult.reason instanceof Error
+            ? portfolioResult.reason.message
+            : String(portfolioResult.reason)
+        );
+      }
+
+      const fillsResult = settled[5];
+      if (fillsResult.status === 'fulfilled') {
+        setExecutionFills(fillsResult.value.fills);
+      } else {
+        errors.push(fillsResult.reason instanceof Error ? fillsResult.reason.message : String(fillsResult.reason));
+      }
+
+      const eventsResult = settled[6];
+      if (eventsResult.status === 'fulfilled') {
+        setExecutionEvents(eventsResult.value.events);
+      } else {
+        errors.push(eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason));
+      }
+
+      const engineResult = settled[7];
+      if (engineResult.status === 'fulfilled') {
+        setExecutionEngineStatus(engineResult.value);
+      } else {
+        errors.push(engineResult.reason instanceof Error ? engineResult.reason.message : String(engineResult.reason));
+      }
+
+      if (errors.length > 0) {
+        setExecutionError(errors[0]);
+      } else {
+        setExecutionError(null);
+      }
+
+      if (manualRefresh) setIsExecutionRefreshing(false);
+    },
+    [executionMarketType, executionSymbol]
+  );
+
+  // Polling: market data
   useEffect(() => {
     let cancelled = false;
 
@@ -99,96 +264,193 @@ const App: React.FC = () => {
     };
   }, [refreshMarketData]);
 
-  // --- Auto-Trading Logic (The Bot) ---
+  // Polling: execution data
   useEffect(() => {
-    if (!isPlaying || !currentData) return;
+    let cancelled = false;
 
-    const premium = currentData.kimchiPremiumPercent;
+    const bootstrap = async () => {
+      await refreshExecutionData(false);
+      if (cancelled) return;
 
-    // ENTRY LOGIC
-    if (tradeStatus === TradeStatus.IDLE) {
-      if (premium >= config.entryThreshold) {
-        setTradeStatus(TradeStatus.ENTERED);
-        setEntryPriceDiff(premium);
+      executionPollingRef.current = window.setInterval(() => {
+        void refreshExecutionData(false);
+      }, EXECUTION_REFRESH_INTERVAL_MS);
+    };
 
-        const newLog: TradeLog = {
-          id: Date.now().toString(),
-          timestamp: currentData.timestamp,
-          type: 'ENTRY',
-          premium: premium,
-          krwPrice: currentData.krwPrice,
-          usdPrice: currentData.usdPrice,
-          description: `김프(${premium.toFixed(2)}%) > 진입가(${config.entryThreshold}%). 델타 중립 포지션 진입.`
-        };
-        setLogs(prev => [newLog, ...prev]);
+    void bootstrap();
+
+    return () => {
+      cancelled = true;
+      if (executionPollingRef.current) {
+        clearInterval(executionPollingRef.current);
+        executionPollingRef.current = null;
       }
-    }
-    // EXIT LOGIC
-    else if (tradeStatus === TradeStatus.ENTERED) {
-      if (premium <= config.exitThreshold) {
-        setTradeStatus(TradeStatus.EXITED);
-        // Gross approximation of profit: Entry Premium - Exit Premium
-        // (Ignoring fees/slippage for the visualizer simplicity)
-        const estimatedProfit = entryPriceDiff - premium;
+    };
+  }, [refreshExecutionData]);
 
-        const newLog: TradeLog = {
-          id: Date.now().toString(),
-          timestamp: currentData.timestamp,
-          type: 'EXIT',
-          premium: premium,
-          krwPrice: currentData.krwPrice,
-          usdPrice: currentData.usdPrice,
-          profit: estimatedProfit,
-          description: `김프(${premium.toFixed(2)}%) < 청산가(${config.exitThreshold}%). 포지션 종료. 확보 차익: ${estimatedProfit.toFixed(2)}%`
-        };
-        setLogs(prev => [newLog, ...prev]);
+  // Fetch discord config on mount
+  useEffect(() => {
+    void (async () => {
+      try {
+        const config = await fetchDiscordConfig();
+        setDiscordConfig(config);
+      } catch { /* silent */ }
+    })();
+  }, []);
 
-        // Reset to IDLE after a brief delay or immediately? Immediately for continuous loop.
-        setTimeout(() => setTradeStatus(TradeStatus.IDLE), 1000);
-      }
-    }
-  }, [currentData, isPlaying, tradeStatus, config, entryPriceDiff]);
+  const handleExecutionEngineToggle = useCallback(async () => {
+    if (isEngineSubmitting) return;
 
-  // --- AI Analysis Handler ---
-  const handleAiAnalysis = useCallback(async () => {
-    if (!currentData) return;
-    setIsAiLoading(true);
-    setAiAdvice(null);
+    const isEngineRunning = executionEngineStatus?.engine.running ?? false;
+    setIsEngineSubmitting(true);
 
     try {
-      const recent = marketData.slice(-5);
-      if (recent.length < 2) {
-        setAiAdvice('AI 분석을 위한 데이터가 아직 충분하지 않습니다. 잠시 후 다시 시도해주세요.');
-        return;
+      if (isEngineRunning) {
+        const response = await stopExecutionEngine('ui-stop');
+        setExecutionEngineStatus(response);
+        setExecutionError(null);
+      } else {
+        if (!Number.isFinite(executionAmount) || executionAmount <= 0) {
+          setExecutionError('주문 수량은 0보다 커야 합니다.');
+          return;
+        }
+        if (config.entryThreshold <= config.exitThreshold) {
+          setExecutionError('진입(판매) 김프는 청산(구매) 김프보다 커야 합니다.');
+          return;
+        }
+        if (!executionDryRun && !executionStatus?.connected) {
+          setExecutionError('실주문 모드에서는 먼저 바이낸스 연결 상태가 connected=true 여야 합니다.');
+          return;
+        }
+
+        const readiness = await fetchExecutionEngineReadiness({
+          mode: executionDryRun ? 'dryrun' : 'live',
+          marketType: executionMarketType,
+          symbol: executionSymbol.trim() || defaultSymbolByMarketType(executionMarketType),
+        });
+        setExecutionReadiness(readiness);
+        const blocking = readiness.checks.find((check) => !check.ok && check.severity === 'error');
+        if (blocking) {
+          setExecutionError(`실행 준비도 실패: ${blocking.message}`);
+          return;
+        }
+
+        const response = await startExecutionEngine({
+          marketType: executionMarketType,
+          symbol: executionSymbol.trim() || defaultSymbolByMarketType(executionMarketType),
+          amount: executionAmount,
+          dryRun: executionDryRun,
+          premiumBasis: 'USD',
+          entryThreshold: config.entryThreshold,
+          exitThreshold: config.exitThreshold,
+        });
+        setExecutionEngineStatus(response);
+        setExecutionError(null);
       }
 
-      const start = recent[0].kimchiPremiumPercent;
-      const end = recent[recent.length - 1].kimchiPremiumPercent;
-      let trend: 'WIDENING' | 'NARROWING' | 'STABLE' = 'STABLE';
-      if (end > start + 0.1) trend = 'WIDENING';
-      if (end < start - 0.1) trend = 'NARROWING';
-
-      const result = await analyzeMarketSituation(
-        currentData.kimchiPremiumPercent,
-        trend,
-        0.01 // Mock funding rate
-      );
-
-      setAiAdvice(result);
+      await refreshExecutionData(false);
     } catch (error) {
-      console.error('AI analysis error:', error);
-      setAiAdvice('AI 분석 호출 중 오류가 발생했습니다.');
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+      await refreshExecutionData(false);
     } finally {
-      setIsAiLoading(false);
+      setIsEngineSubmitting(false);
     }
-  }, [currentData, marketData]);
+  }, [
+    config.entryThreshold,
+    config.exitThreshold,
+    executionAmount,
+    executionDryRun,
+    executionEngineStatus?.engine.running,
+    executionMarketType,
+    executionStatus?.connected,
+    executionSymbol,
+    isEngineSubmitting,
+    refreshExecutionData,
+  ]);
 
-  // Status map for display
-  const statusMap = {
-    [TradeStatus.IDLE]: '대기 중 (Idle)',
-    [TradeStatus.ENTERED]: '진입 완료 (Entered)',
-    [TradeStatus.EXITED]: '청산 완료 (Exited)'
-  };
+
+  const handleSaveExecutionCredentials = useCallback(async () => {
+    if (isCredentialSubmitting) return;
+    if (!executionApiKeyInput.trim() || !executionApiSecretInput.trim()) {
+      setExecutionError('API 키와 시크릿을 모두 입력하세요.');
+      return;
+    }
+
+    setIsCredentialSubmitting(true);
+    try {
+      const response = await updateExecutionCredentials({
+        apiKey: executionApiKeyInput.trim(),
+        apiSecret: executionApiSecretInput.trim(),
+        persist: executionCredentialPersist,
+      });
+      setExecutionCredentialsStatus(response);
+      setExecutionApiKeyInput('');
+      setExecutionApiSecretInput('');
+      setExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+    } finally {
+      setIsCredentialSubmitting(false);
+    }
+  }, [
+    executionApiKeyInput,
+    executionApiSecretInput,
+    executionCredentialPersist,
+    isCredentialSubmitting,
+    refreshExecutionData,
+  ]);
+
+  const handleClearExecutionCredentials = useCallback(async () => {
+    if (isCredentialSubmitting) return;
+    if (!window.confirm('런타임 API 키를 삭제할까요? (환경변수 키는 삭제되지 않습니다)')) return;
+
+    setIsCredentialSubmitting(true);
+    try {
+      const response = await clearExecutionCredentials();
+      setExecutionCredentialsStatus(response);
+      setExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+    } finally {
+      setIsCredentialSubmitting(false);
+    }
+  }, [isCredentialSubmitting, refreshExecutionData]);
+
+  const handleResetExecutionSafety = useCallback(async () => {
+    try {
+      const response = await resetExecutionSafety('ui-manual-reset');
+      setExecutionSafety(response);
+      setExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+    }
+  }, [refreshExecutionData]);
+
+  const handleCheckExecutionReadiness = useCallback(async () => {
+    if (isReadinessChecking) return;
+    setIsReadinessChecking(true);
+    try {
+      const response = await fetchExecutionEngineReadiness({
+        mode: executionDryRun ? 'dryrun' : 'live',
+        marketType: executionMarketType,
+        symbol: executionSymbol.trim() || defaultSymbolByMarketType(executionMarketType),
+      });
+      setExecutionReadiness(response);
+      setExecutionError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+    } finally {
+      setIsReadinessChecking(false);
+    }
+  }, [executionDryRun, executionMarketType, executionSymbol, isReadinessChecking]);
 
   const isDataFresh =
     currentData !== null &&
@@ -219,12 +481,73 @@ const App: React.FC = () => {
     ? currentData.normalizedGlobalKrwPrice ?? currentData.usdPrice * effectiveConversionRate
     : 0;
 
-  const defaultFundingNotionalUsdt = useMemo(
-    () => Math.max(50, Math.round(config.investmentKrw / Math.max(1, effectiveConversionRate))),
-    [config.investmentKrw, effectiveConversionRate]
-  );
+  const executionConnected = executionStatus?.connected ?? false;
 
-  // --- Render Helpers ---
+  const executionConfigured = executionStatus?.configured ?? false;
+  const executionCredentialSource =
+    executionCredentialsStatus?.credentials.source ??
+    executionStatus?.credentialSource ??
+    'none';
+  const executionCredentialHint =
+    executionCredentialsStatus?.credentials.keyHint ??
+    executionStatus?.credentialKeyHint ??
+    null;
+  const executionCredentialUpdatedAt =
+    executionCredentialsStatus?.credentials.updatedAt ??
+    executionStatus?.credentialUpdatedAt ??
+    null;
+  const executionCredentialPersisted =
+    executionCredentialsStatus?.credentials.persisted ??
+    executionStatus?.credentialPersisted ??
+    false;
+  const executionSafeMode = executionSafety?.safety?.safeMode ?? false;
+  const isPlaying = executionEngineStatus?.engine.running ?? false;
+  const enginePositionState = executionEngineStatus?.engine.positionState ?? 'IDLE';
+  const engineLastPremium = executionEngineStatus?.engine.lastPremium ?? null;
+  const executionPortfolioSummary = executionPortfolio?.summary;
+  const executionPortfolioBalanceAsset =
+    executionPortfolio?.balanceAsset ??
+    executionStatus?.balance?.asset ??
+    (executionMarketType === 'usdm' ? 'USDT' : 'BTC');
+  const executionWalletFree =
+    executionPortfolioSummary?.walletAssetFree ??
+    executionStatus?.balance?.free ??
+    null;
+  const executionWalletUsed =
+    executionPortfolioSummary?.walletAssetUsed ??
+    executionStatus?.balance?.used ??
+    null;
+  const executionWalletTotal =
+    executionPortfolioSummary?.walletAssetTotal ??
+    executionStatus?.balance?.total ??
+    null;
+  const executionTotalUnrealizedPnl =
+    executionPortfolioSummary?.totalUnrealizedPnl ??
+    executionPosition?.position?.unrealizedPnl ??
+    null;
+  const executionPrimaryPositionNotional =
+    executionPosition?.position?.notional ?? null;
+  const balanceAssetToKrw =
+    executionPortfolioBalanceAsset === 'BTC'
+      ? (currentData?.krwPrice ?? null)
+      : (currentData?.usdtKrwRate ?? currentData?.exchangeRate ?? null);
+  const executionWalletTotalKrw =
+    executionWalletTotal != null && Number.isFinite(balanceAssetToKrw ?? NaN)
+      ? executionWalletTotal * balanceAssetToKrw
+      : null;
+  const executionBalanceText =
+    `${executionPortfolioBalanceAsset} ${formatNullableNumber(executionWalletFree, 8)}`;
+  const sidebarSections: Array<{ key: SidebarSection; label: string; description: string }> = [
+    { key: 'automation', label: '자동매매', description: '실행 설정/리스크' },
+    { key: 'portfolio', label: '포트폴리오', description: '잔고/체결/이벤트' },
+    { key: 'backtest', label: '백테스트', description: '전략 검증 결과' },
+    { key: 'settings', label: '설정', description: 'API/디스코드 설정' },
+  ];
+  const isAutomationTab = activeSection === 'automation';
+  const isPortfolioTab = activeSection === 'portfolio';
+  const isBacktestTab = activeSection === 'backtest';
+  const isSettingsTab = activeSection === 'settings';
+
   if (isInitialLoading && !currentData) {
     return (
       <div className="h-screen w-full bg-slate-950 flex items-center justify-center text-slate-500">
@@ -251,239 +574,800 @@ const App: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-6 lg:p-8 font-sans">
-
-      {/* Header */}
-      <header className="flex flex-col md:flex-row justify-between items-center mb-8 gap-4 border-b border-slate-800 pb-6">
-        <div>
-          <h1 className="text-3xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent flex items-center gap-3">
-            <Activity className="text-emerald-400" />
+    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden">
+      {/* Sidebar */}
+      <aside className="w-64 bg-slate-900 border-r border-slate-800 flex flex-col">
+        <div className="p-6 border-b border-slate-800">
+          <h1 className="text-xl font-bold bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent flex items-center gap-2">
+            <Activity className="text-emerald-400 w-6 h-6" />
             델타 중립 봇
           </h1>
-          <p className="text-slate-500 mt-2 max-w-xl text-sm">
-            국내(KRW)와 해외(USDT) 거래소 간의 가격 괴리를 이용한 델타 중립 전략 대시보드.
-          </p>
+          <p className="text-slate-500 text-xs mt-1">Delta Neutral Strategy</p>
         </div>
 
-        <div className="flex items-center gap-4">
-          {/* API Key Check - purely visual for this demo context */}
-          <div className="hidden md:flex flex-col items-end mr-4">
-            <span className="text-[10px] uppercase text-slate-500 tracking-wider font-bold">시스템 상태</span>
-            <span className={`flex items-center gap-1 text-xs ${statusColor}`}>
+        <nav className="flex-1 p-4 space-y-1 overflow-y-auto">
+          {sidebarSections.map((section) => (
+            <button
+              key={section.key}
+              onClick={() => setActiveSection(section.key)}
+              className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg text-left transition-all ${activeSection === section.key
+                ? 'bg-slate-800 text-emerald-400 border border-slate-700 shadow-sm'
+                : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
+                }`}
+            >
+              <div className={`w-1 h-8 rounded-full ${activeSection === section.key ? 'bg-emerald-500' : 'bg-transparent'}`}></div>
+              <div>
+                <div className="font-medium text-sm">{section.label}</div>
+                <div className="text-[10px] opacity-70">{section.description}</div>
+              </div>
+            </button>
+          ))}
+        </nav>
+
+        <div className="p-4 border-t border-slate-800">
+          {/* API Key Check - simplified for sidebar */}
+          <div className="flex flex-col gap-2">
+            <div className="flex justify-between items-center text-xs">
+              <span className="text-slate-500 font-bold">SYSTEM STATUS</span>
               <span className={`w-2 h-2 rounded-full ${marketError ? 'bg-rose-500' : isDataFresh ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
-              {statusText}
-            </span>
-            <span className="text-[10px] text-slate-500 mt-1">최근 갱신: {formattedLastUpdated}</span>
-          </div>
-
-          <button
-            onClick={() => void refreshMarketData(true)}
-            disabled={isRefreshing}
-            className="flex items-center gap-2 px-4 py-3 rounded-lg font-bold transition-all shadow-lg bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-60"
-          >
-            {isRefreshing ? <RefreshCw size={16} className="animate-spin" /> : <RefreshCw size={16} />}
-            새로고침
-          </button>
-
-          <button
-            onClick={() => setIsPlaying(!isPlaying)}
-            className={`flex items-center gap-2 px-6 py-3 rounded-lg font-bold transition-all shadow-lg ${isPlaying
-              ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-rose-900/20'
-              : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-900/20'
-              }`}
-          >
-            {isPlaying ? <><Pause size={18} /> 봇 중지</> : <><Play size={18} /> 봇 시작</>}
-          </button>
-        </div>
-      </header>
-
-      {marketError && (
-        <div className="mb-6 bg-rose-950/30 border border-rose-800/60 rounded-lg px-4 py-3 text-sm text-rose-200">
-          실시간 데이터 오류: {marketError}
-        </div>
-      )}
-
-      {/* Main Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-
-        {/* Left Col: Config & Visualizer (4 cols) */}
-        <div className="lg:col-span-4 space-y-6">
-
-          {/* Strategy Visualizer */}
-          <StrategyVisualizer />
-
-          {/* Configuration Panel */}
-          <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
-            <h3 className="text-lg font-semibold text-slate-200 mb-4 flex items-center gap-2">
-              <Settings className="w-5 h-5 text-slate-400" />
-              봇 파라미터 설정
-            </h3>
-
-            <div className="space-y-4">
-              <div>
-                <label className="flex justify-between text-sm text-slate-400 mb-2">
-                  <span>진입 임계값 (김프 &gt;)</span>
-                  <span className="text-emerald-400 font-mono">{config.entryThreshold}%</span>
-                </label>
-                <input
-                  type="range" min="1" max="10" step="0.1"
-                  value={config.entryThreshold}
-                  onChange={(e) => setConfig({ ...config, entryThreshold: parseFloat(e.target.value) })}
-                  className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                />
-              </div>
-
-              <div>
-                <label className="flex justify-between text-sm text-slate-400 mb-2">
-                  <span>청산 임계값 (김프 &lt;)</span>
-                  <span className="text-indigo-400 font-mono">{config.exitThreshold}%</span>
-                </label>
-                <input
-                  type="range" min="-1" max="5" step="0.1"
-                  value={config.exitThreshold}
-                  onChange={(e) => setConfig({ ...config, exitThreshold: parseFloat(e.target.value) })}
-                  className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-                />
-              </div>
-
-              <div>
-                <label className="flex justify-between text-sm text-slate-400 mb-2">
-                  <span>시뮬레이션 자본금</span>
-                  <span className="text-slate-200 font-mono">{(config.investmentKrw / 1000000).toFixed(0)}백만 KRW</span>
-                </label>
-                <div className="h-2 bg-slate-800 rounded-lg overflow-hidden">
-                  <div className="h-full bg-slate-600 w-full"></div>
-                </div>
-              </div>
             </div>
-
-            <div className="mt-6 pt-4 border-t border-slate-800">
-              <div className="flex justify-between items-center text-sm">
-                <span className="text-slate-500">상태</span>
-                <span className={`font-bold px-2 py-1 rounded text-xs ${tradeStatus === TradeStatus.ENTERED ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-700/30 text-slate-400'
-                  }`}>
-                  {statusMap[tradeStatus]}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Risk Checklist */}
-          <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
-            <h3 className="text-lg font-semibold text-slate-200 mb-4 flex items-center gap-2">
-              <AlertTriangle className="w-5 h-5 text-amber-500" />
-              주요 리스크 요인
-            </h3>
-            <ul className="space-y-3">
-              {RISKS.map(risk => (
-                <li key={risk.id} className="flex items-start gap-3 text-sm p-2 rounded hover:bg-slate-800/50 transition-colors cursor-help group relative">
-                  <div className={`mt-1 w-2 h-2 rounded-full flex-shrink-0 ${risk.level === 'HIGH' ? 'bg-rose-500' : risk.level === 'MEDIUM' ? 'bg-amber-500' : 'bg-blue-500'
-                    }`} />
-                  <div>
-                    <span className="text-slate-300 block font-medium">{risk.name}</span>
-                    <span className="text-slate-500 text-xs hidden group-hover:block transition-all">{risk.description}</span>
-                  </div>
-                </li>
-              ))}
-            </ul>
+            <div className={`text-xs ${statusColor} truncate`}>{statusText}</div>
+            <div className="text-[10px] text-slate-600 truncate">{formattedLastUpdated}</div>
           </div>
         </div>
+      </aside>
 
-        {/* Center & Right Col: Data & Charts (8 cols) */}
-        <div className="lg:col-span-8 flex flex-col gap-6">
+      {/* Main Content Area */}
+      <main className="flex-1 flex flex-col h-full overflow-hidden">
+        {/* Top Bar for Mobile/Tablet or Global Actions */}
+        <header className="h-16 bg-slate-950/80 backdrop-blur border-b border-slate-800 flex items-center justify-between px-6 shrink-0">
+          <h2 className="text-lg font-semibold text-slate-100">
+            {sidebarSections.find(s => s.key === activeSection)?.label}
+          </h2>
 
-          {/* Top Metrics Row */}
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
-            <MetricCard
-              title="김치 프리미엄"
-              value={`${currentData.kimchiPremiumPercent.toFixed(2)}%`}
-              subValue="USD/KRW 기준"
-              trend={currentData.kimchiPremiumPercent > 0 ? 'up' : 'down'}
-              icon={<Zap size={18} />}
-              highlight={currentData.kimchiPremiumPercent > config.entryThreshold}
-            />
-            <MetricCard
-              title="USDT 실질 김프"
-              value={`${(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent).toFixed(2)}%`}
-              subValue={`USDT 프리미엄: ${(currentData.usdtPremiumPercent ?? 0).toFixed(2)}%`}
-              trend={(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent) > 0 ? 'up' : 'down'}
-            />
-            <MetricCard
-              title="국내 시세 (KRW)"
-              value={`₩${(currentData.krwPrice).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
-              subValue={currentData.sources?.domestic ?? 'upbit:KRW-BTC'}
-            />
-            <MetricCard
-              title="해외 시세 (USDT)"
-              value={`$${(currentData.usdPrice).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
-              subValue={currentData.sources?.global ?? 'binance:BTCUSDT'}
-            />
-            <MetricCard
-              title="환율 (USD/KRW)"
-              value={`₩${currentData.exchangeRate.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-              subValue={`USDT/KRW: ₩${currentData.usdtKrwRate?.toFixed(0) ?? '-'}`}
-              icon={<DollarSign size={18} />}
-            />
+          <div className="flex items-center gap-4">
+            {marketError && (
+              <span className="text-xs text-rose-400 font-medium px-3 py-1 bg-rose-950/30 border border-rose-900/50 rounded-full animate-pulse">
+                Connection Error
+              </span>
+            )}
+            <button
+              onClick={() => void refreshMarketData(true)}
+              disabled={isRefreshing}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors disabled:opacity-50"
+            >
+              {isRefreshing ? <RefreshCw size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+              Refresh
+            </button>
           </div>
+        </header>
 
-          <div className="bg-slate-900/40 border border-slate-800 rounded-xl px-4 py-3 text-xs flex flex-col md:flex-row justify-between gap-2 text-slate-400">
-            <span>해외 환산가 (USD 기준): ₩{normalizedGlobalKrwPrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-            <span>USDT/KRW: {currentData.usdtKrwRate?.toFixed(2) ?? '-'} · USD/KRW: {currentData.exchangeRate.toFixed(2)}</span>
-            <span>마지막 성공 갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
-          </div>
+        {/* Scrollable Content */}
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="max-w-7xl mx-auto space-y-6">
 
-          <MultiCoinPremiumTable />
-
-          <TopFundingTable defaultNotionalUsdt={defaultFundingNotionalUsdt} />
-
-          {/* Main Chart */}
-          <PremiumChart
-            entryThreshold={config.entryThreshold}
-            exitThreshold={config.exitThreshold}
-          />
-
-          {/* Bottom Row: AI & Logs */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 h-[350px]">
-
-            {/* AI Advisor */}
-            <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6 flex flex-col relative overflow-hidden">
-              <div className="flex justify-between items-center mb-4 z-10">
-                <h3 className="font-semibold text-slate-200 flex items-center gap-2">
-                  <MessageSquare className="w-4 h-4 text-cyan-400" />
-                  AI 전략 분석가
-                </h3>
-                <button
-                  onClick={handleAiAnalysis}
-                  disabled={isAiLoading}
-                  className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1 rounded-full flex items-center gap-1 transition-colors"
-                >
-                  {isAiLoading ? <RefreshCw className="animate-spin w-3 h-3" /> : <RefreshCw className="w-3 h-3" />}
-                  분석하기
-                </button>
+            {marketError && (
+              <div className="bg-rose-950/30 border border-rose-800/60 rounded-lg px-4 py-3 text-sm text-rose-200">
+                실시간 데이터 오류: {marketError}
               </div>
+            )}
 
-              <div className="flex-1 overflow-y-auto z-10 custom-scrollbar">
-                {aiAdvice ? (
-                  <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-700 text-sm leading-relaxed text-slate-300">
-                    {aiAdvice}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+              {/* Left Col: Data & Charts (Now on the left/center) */}
+              <div className={`${isAutomationTab || isPortfolioTab ? 'lg:col-span-8' : 'lg:col-span-12'} flex flex-col gap-6`}>
+
+                {/* Top Metrics Row */}
+                {isAutomationTab && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                    <MetricCard
+                      title="BTC 김프 (USD)"
+                      value={`${currentData.kimchiPremiumPercent.toFixed(2)}%`}
+                      subValue={`${currentData.exchangeRate.toFixed(1)} USD/KRW`}
+                      trend={currentData.kimchiPremiumPercent > 0 ? 'up' : 'down'}
+                      icon={<Zap size={16} strokeWidth={2.5} />}
+                      highlight={currentData.kimchiPremiumPercent > (config.entryThreshold || 3)}
+                    />
+                    <MetricCard
+                      title="USDT 실질 김프"
+                      value={`${(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent).toFixed(2)}%`}
+                      subValue={`USDT-P: ${(currentData.usdtPremiumPercent ?? 0).toFixed(2)}%`}
+                      trend={(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent) > 0 ? 'up' : 'down'}
+                      icon={<Activity size={16} />}
+                    />
+                    <MetricCard
+                      title="국내 시세 (KRW)"
+                      value={`₩${Math.round(currentData.krwPrice / 10000).toLocaleString()}만`}
+                      subValue={`${currentData.sources?.domestic?.split(':')[1] ?? 'BTC-KRW'}`}
+                      icon={<TrendingUp size={16} />}
+                    />
+                    <MetricCard
+                      title="해외 시세 (USDT)"
+                      value={`$${(currentData.usdPrice).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
+                      subValue={`${currentData.sources?.global?.split(':')[1] ?? 'BTC-USDT'}`}
+                      icon={<Activity size={16} />}
+                    />
+                    <MetricCard
+                      title="환율 (USD/KRW)"
+                      value={`₩${currentData.exchangeRate.toLocaleString(undefined, { maximumFractionDigits: 1 })}`}
+                      subValue={`USDT: ₩${currentData.usdtKrwRate?.toFixed(1) ?? '-'}`}
+                      icon={<DollarSign size={16} />}
+                    />
                   </div>
-                ) : (
-                  <div className="text-slate-600 text-sm italic flex h-full items-center justify-center text-center px-4">
-                    '분석하기'를 클릭하면 Gemini AI가 델타 중립 전략을 바탕으로 현재 시장 상황을 진단합니다.
+                )}
+
+                {isAutomationTab && (
+                  <div className="bg-slate-900/40 border border-slate-800 rounded-xl px-4 py-3 text-xs flex flex-col md:flex-row justify-between gap-2 text-slate-400">
+                    <span>해외 환산가 (USD 기준): ₩{normalizedGlobalKrwPrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                    <span>USDT/KRW: {currentData.usdtKrwRate?.toFixed(2) ?? '-'} · USD/KRW: {currentData.exchangeRate.toFixed(2)}</span>
+                    <span>마지막 성공 갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
+                  </div>
+                )}
+
+                {isAutomationTab && (
+                  <div className="min-h-[500px] flex flex-col">
+                    <PremiumChart
+                      entryThreshold={config.entryThreshold}
+                      exitThreshold={config.exitThreshold}
+                    />
+                  </div>
+                )}
+
+                {isBacktestTab && (
+                  <div id="backtest-section" className="space-y-2">
+                    <BacktestPanel
+                      defaultEntryThreshold={config.entryThreshold}
+                      defaultExitThreshold={config.exitThreshold}
+                      defaultInvestmentKrw={config.investmentKrw}
+                    />
+                  </div>
+                )}
+
+                {isSettingsTab && (
+                  <div id="settings-section" className="space-y-6">
+                    {/* Binance API Key Management */}
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">바이난스 API 키 관리</h3>
+                      <div className="space-y-3">
+                        <div className="text-[11px] text-slate-500 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span>현재 키 설정: {executionConfigured ? '✅ 설정됨' : '❌ 미설정'}</span>
+                            <span className="opacity-40">|</span>
+                            <span>바이낸스 연결: {executionConnected ? '🟢 정상' : executionConfigured ? '🔴 오류 (키 확인 필요)' : '⚪ 미설정'}</span>
+                          </div>
+                          {executionConnected && executionStatus?.balance && (
+                            <div className="text-emerald-400 font-mono">
+                              잔고: {executionStatus.balance.free} {executionStatus.balance.asset} (사용가능)
+                            </div>
+                          )}
+                          <div className="pt-1 opacity-70">
+                            source: {executionCredentialSource}
+                            {executionCredentialHint ? ` · ${executionCredentialHint}` : ''}
+                            {executionCredentialUpdatedAt ? ` · ${new Date(executionCredentialUpdatedAt).toLocaleTimeString('ko-KR')}` : ''}
+                            {executionCredentialPersisted ? ' · persisted' : ''}
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={executionApiKeyInput}
+                            onChange={(e) => setExecutionApiKeyInput(e.target.value)}
+                            placeholder="BINANCE_API_KEY"
+                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-cyan-500 outline-none"
+                          />
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={executionApiSecretInput}
+                            onChange={(e) => setExecutionApiSecretInput(e.target.value)}
+                            placeholder="BINANCE_API_SECRET"
+                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-cyan-500 outline-none"
+                          />
+                        </div>
+                        <label className="text-[11px] text-slate-400 inline-flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={executionCredentialPersist}
+                            onChange={(e) => setExecutionCredentialPersist(e.target.checked)}
+                            className="accent-cyan-500 w-3.5 h-3.5 rounded border-slate-700 bg-slate-800"
+                          />
+                          서버 재시작 후에도 키 유지(.runtime 저장)
+                        </label>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => void handleSaveExecutionCredentials()}
+                            disabled={isCredentialSubmitting}
+                            className="px-3 py-1.5 rounded bg-cyan-900/30 border border-cyan-800/50 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-60 transition-colors"
+                          >
+                            {isCredentialSubmitting ? '저장 중...' : '키 저장/적용'}
+                          </button>
+                          <button
+                            onClick={() => void refreshExecutionData(true)}
+                            disabled={isExecutionRefreshing}
+                            className="px-3 py-1.5 rounded bg-emerald-900/30 border border-emerald-800/50 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-60 transition-colors"
+                          >
+                            {isExecutionRefreshing ? '확인 중...' : '연결 테스트'}
+                          </button>
+                          <button
+                            onClick={() => void handleClearExecutionCredentials()}
+                            disabled={isCredentialSubmitting}
+                            className="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-60 transition-colors"
+                          >
+                            런타임 키 삭제
+                          </button>
+                        </div>
+                        {executionError && (
+                          <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
+                            {executionError}
+                          </div>
+                        )}
+                        {executionStatus?.error && (
+                          <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
+                            바이낸스 오류: {executionStatus.error}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Discord Webhook Config */}
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">디스코드 알림 설정</h3>
+                      <div className="space-y-3">
+                        <div className="text-[11px] text-slate-500">
+                          상태: {discordConfig?.configured ? '✅ 연결됨' : '❌ 미설정'}
+                          {discordConfig?.webhookUrlMasked ? ` · ${discordConfig.webhookUrlMasked}` : ''}
+                        </div>
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          value={discordWebhookInput}
+                          onChange={(e) => setDiscordWebhookInput(e.target.value)}
+                          placeholder="https://discord.com/api/webhooks/..."
+                          className="w-full bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono text-xs focus:ring-1 focus:ring-indigo-500 outline-none"
+                        />
+                        <div className="flex gap-2">
+                          <button
+                            onClick={async () => {
+                              setIsDiscordSubmitting(true);
+                              setDiscordMessage(null);
+                              try {
+                                const result = await updateDiscordConfig(discordWebhookInput.trim());
+                                setDiscordConfig({ configured: result.configured, webhookUrlMasked: '' });
+                                setDiscordMessage(result.message);
+                                setDiscordWebhookInput('');
+                                const fresh = await fetchDiscordConfig();
+                                setDiscordConfig(fresh);
+                              } catch (e) {
+                                setDiscordMessage(e instanceof Error ? e.message : '오류 발생');
+                              } finally {
+                                setIsDiscordSubmitting(false);
+                              }
+                            }}
+                            disabled={isDiscordSubmitting}
+                            className="px-3 py-1.5 rounded bg-indigo-900/30 border border-indigo-800/50 text-xs font-semibold text-indigo-200 hover:bg-indigo-900/40 disabled:opacity-60 transition-colors"
+                          >
+                            {isDiscordSubmitting ? '저장 중...' : '웹훅 저장'}
+                          </button>
+                          <button
+                            onClick={async () => {
+                              setIsDiscordSubmitting(true);
+                              setDiscordMessage(null);
+                              try {
+                                const result = await sendDiscordTest();
+                                setDiscordMessage(result.message);
+                              } catch (e) {
+                                setDiscordMessage(e instanceof Error ? e.message : '테스트 실패');
+                              } finally {
+                                setIsDiscordSubmitting(false);
+                              }
+                            }}
+                            disabled={isDiscordSubmitting || !discordConfig?.configured}
+                            className="px-3 py-1.5 rounded bg-emerald-900/30 border border-emerald-800/50 text-xs font-semibold text-emerald-200 hover:bg-emerald-900/40 disabled:opacity-60 transition-colors"
+                          >
+                            테스트 알림 보내기
+                          </button>
+                          {discordConfig?.configured && (
+                            <button
+                              onClick={async () => {
+                                setIsDiscordSubmitting(true);
+                                setDiscordMessage(null);
+                                try {
+                                  const result = await updateDiscordConfig('');
+                                  setDiscordConfig({ configured: result.configured, webhookUrlMasked: '' });
+                                  setDiscordMessage('웹훅 URL 삭제됨');
+                                } catch (e) {
+                                  setDiscordMessage(e instanceof Error ? e.message : '오류');
+                                } finally {
+                                  setIsDiscordSubmitting(false);
+                                }
+                              }}
+                              disabled={isDiscordSubmitting}
+                              className="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-60 transition-colors"
+                            >
+                              웹훅 삭제
+                            </button>
+                          )}
+                        </div>
+                        {discordMessage && (
+                          <div className="text-xs text-indigo-300 bg-indigo-950/30 border border-indigo-800/50 rounded px-3 py-2">
+                            {discordMessage}
+                          </div>
+                        )}
+                        <div className="text-[10px] text-slate-600 space-y-1">
+                          <p>🔴 판매 체결 / 🟢 매수 체결 알림</p>
+                          <p>▶️ 엔진 시작 / ⏹️ 엔진 정지 알림</p>
+                          <p>📊 1시간 간격 김프 정기 보고</p>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
 
-              {/* Decoration */}
-              <div className="absolute -bottom-10 -right-10 w-32 h-32 bg-cyan-500/10 rounded-full blur-3xl z-0 pointer-events-none"></div>
+              {/* Right Col: Settings & Controls (Now on the right) */}
+              {(isAutomationTab || isPortfolioTab) && (
+                <div className="lg:col-span-4 space-y-6">
+
+                  {isAutomationTab && (
+                    <div id="automation-section" className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">자동매매 실행 설정</h3>
+                      <div className="space-y-3 text-sm">
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            시장
+                            <select
+                              value={executionMarketType}
+                              onChange={(e) => setExecutionMarketType(e.target.value === 'usdm' ? 'usdm' : 'coinm')}
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 focus:ring-1 focus:ring-emerald-500 outline-none"
+                            >
+                              <option value="coinm">COIN-M</option>
+                              <option value="usdm">USDT-M</option>
+                            </select>
+                          </label>
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            주문 수량
+                            <input
+                              type="number"
+                              min={0.0001}
+                              step={0.0001}
+                              value={executionAmount}
+                              onChange={(e) => setExecutionAmount(Math.max(0, Number(e.target.value)))}
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            진입(판매) 김프 %
+                            <input
+                              type="number"
+                              step={0.1}
+                              value={config.entryThreshold}
+                              onChange={(e) =>
+                                setConfig((prev) => ({
+                                  ...prev,
+                                  entryThreshold: Number(e.target.value),
+                                }))
+                              }
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                            />
+                          </label>
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            청산(구매) 김프 %
+                            <input
+                              type="number"
+                              step={0.1}
+                              value={config.exitThreshold}
+                              onChange={(e) =>
+                                setConfig((prev) => ({
+                                  ...prev,
+                                  exitThreshold: Number(e.target.value),
+                                }))
+                              }
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                            />
+                          </label>
+                        </div>
+
+                        <label className="text-slate-400 flex flex-col gap-1">
+                          심볼
+                          <input
+                            type="text"
+                            value={executionSymbol}
+                            onChange={(e) => setExecutionSymbol(e.target.value)}
+                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                          />
+                        </label>
+
+                        <label className="text-slate-400 flex items-center gap-2 p-1">
+                          <input
+                            type="checkbox"
+                            checked={executionDryRun}
+                            onChange={(e) => setExecutionDryRun(e.target.checked)}
+                            className="accent-cyan-500 w-4 h-4 rounded border-slate-700 bg-slate-800"
+                          />
+                          드라이런 모드(실주문 없음)
+                        </label>
+
+                        <button
+                          onClick={() => void handleExecutionEngineToggle()}
+                          disabled={isEngineSubmitting}
+                          className={`w-full flex items-center justify-center gap-2 px-6 py-3 rounded-lg font-bold transition-all shadow-lg mt-2 ${isPlaying
+                            ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-rose-900/20'
+                            : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-900/20'
+                            } disabled:opacity-60`}
+                        >
+                          {isPlaying ? <><Pause size={18} /> 자동매매 정지</> : <><Play size={18} /> 자동매매 시작</>}
+                        </button>
+
+                        <div className="grid grid-cols-2 gap-2 text-xs pt-2">
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            연결: <span className={executionConnected ? 'text-emerald-400' : 'text-rose-400'}>{executionConnected ? '정상' : '실패'}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            설정: <span className={executionConfigured ? 'text-emerald-400' : 'text-amber-400'}>{executionConfigured ? '완료' : '미설정'}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            엔진: <span className={isPlaying ? 'text-emerald-400' : 'text-slate-400'}>{isPlaying ? '실행중' : '중지'}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            Safe Mode: <span className={executionSafeMode ? 'text-rose-400' : 'text-emerald-400'}>{executionSafeMode ? 'ON' : 'OFF'}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            포지션: <span className={enginePositionState === 'ENTERED' ? 'text-amber-400' : 'text-slate-300'}>{enginePositionState}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            잔고: <span className="text-slate-300 font-mono">{executionBalanceText}</span>
+                          </div>
+                          <div className="rounded border border-slate-800 bg-slate-950/40 px-2 py-2">
+                            엔진 김프: <span className="text-slate-300 font-mono">{engineLastPremium == null ? '-' : `${engineLastPremium.toFixed(2)}%`}</span>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2 pt-2">
+                          <button
+                            onClick={() => void refreshExecutionData(true)}
+                            disabled={isExecutionRefreshing}
+                            className="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-semibold hover:bg-slate-700 disabled:opacity-60 transition-colors"
+                          >
+                            {isExecutionRefreshing ? '갱신 중...' : '실행상태 새로고침'}
+                          </button>
+                          <button
+                            onClick={() => void handleResetExecutionSafety()}
+                            className="px-3 py-1.5 rounded bg-amber-900/20 border border-amber-800/50 text-xs font-semibold text-amber-500 hover:bg-amber-900/30 transition-colors"
+                          >
+                            Safe Mode 리셋
+                          </button>
+                          <button
+                            onClick={() => void handleCheckExecutionReadiness()}
+                            disabled={isReadinessChecking}
+                            className="px-3 py-1.5 rounded bg-indigo-900/20 border border-indigo-800/50 text-xs font-semibold text-indigo-300 hover:bg-indigo-900/30 disabled:opacity-60 transition-colors"
+                          >
+                            {isReadinessChecking ? '준비도 점검 중...' : '실행 준비도 점검'}
+                          </button>
+                        </div>
+
+                        {executionReadiness && (
+                          <div className={`text-xs rounded px-3 py-2 mt-2 border ${executionReadiness.ready
+                            ? 'text-emerald-200 bg-emerald-950/30 border-emerald-800/40'
+                            : 'text-amber-200 bg-amber-950/30 border-amber-800/40'
+                            }`}>
+                            준비도: {executionReadiness.ready ? 'READY' : 'NOT READY'} · 모드: {executionReadiness.mode.toUpperCase()}
+                            {' '}· 점검시간: {new Date(executionReadiness.timestamp).toLocaleTimeString('ko-KR')}
+                          </div>
+                        )}
+
+                        {executionReadiness && executionReadiness.checks.some((check) => !check.ok) && (
+                          <div className="text-[11px] text-slate-300 bg-slate-950/60 border border-slate-800 rounded px-3 py-2 space-y-1">
+                            {executionReadiness.checks
+                              .filter((check) => !check.ok)
+                              .slice(0, 4)
+                              .map((check) => (
+                                <div key={check.key}>
+                                  [{check.severity.toUpperCase()}] {check.message}
+                                </div>
+                              ))}
+                          </div>
+                        )}
+
+                        {executionError && (
+                          <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
+                            실행 오류: {executionError}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {isPortfolioTab && (
+                    <div id="portfolio-section" className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-semibold text-slate-200">보유자산 포트폴리오</h3>
+                        <button
+                          onClick={() => document.getElementById('portfolio-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                          className="text-[11px] px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700"
+                        >
+                          상세 보기
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3 text-xs">
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <span className="block text-slate-500 text-[10px] mb-1">총 보유</span>
+                          <span className="text-slate-200 font-mono text-sm">{formatNullableNumber(executionWalletTotal, 8)} {executionPortfolioBalanceAsset}</span>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <span className="block text-slate-500 text-[10px] mb-1">가용 자산</span>
+                          <span className="text-slate-200 font-mono text-sm">{formatNullableNumber(executionWalletFree, 8)}</span>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <span className="block text-slate-500 text-[10px] mb-1">미실현손익</span>
+                          <span className={`font-mono text-sm ${executionTotalUnrealizedPnl != null && executionTotalUnrealizedPnl < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>{formatSignedNumber(executionTotalUnrealizedPnl, 8)}</span>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <span className="block text-slate-500 text-[10px] mb-1">오픈 포지션</span>
+                          <span className="text-slate-200 font-mono text-sm">{executionPortfolio?.summary?.activePositionCount ?? 0}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isPortfolioTab && (
+                <div id="portfolio-detail" className="lg:col-span-12 bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-base font-semibold text-slate-200">상세 포트폴리오</h3>
+                    <span className="text-[10px] uppercase tracking-wider text-slate-500 border border-slate-800 px-2 py-1 rounded">
+                      {executionPortfolio?.testnet ? 'Testnet' : 'Live'} · {executionMarketType.toUpperCase()}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs mb-4">
+                    <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                      <div className="text-slate-500">총 보유 ({executionPortfolioBalanceAsset})</div>
+                      <div className="text-slate-200 font-mono">
+                        {formatNullableNumber(executionWalletTotal, 8)}
+                      </div>
+                      <div className="text-slate-500">
+                        ₩{formatNullableNumber(executionWalletTotalKrw, 0)}
+                      </div>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                      <div className="text-slate-500">가용 잔고</div>
+                      <div className="text-slate-200 font-mono">
+                        {formatNullableNumber(executionWalletFree, 8)}
+                      </div>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                      <div className="text-slate-500">사용 중 잔고</div>
+                      <div className="text-slate-200 font-mono">
+                        {formatNullableNumber(executionWalletUsed, 8)}
+                      </div>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                      <div className="text-slate-500">미실현 손익</div>
+                      <div
+                        className={`font-mono ${executionTotalUnrealizedPnl != null && executionTotalUnrealizedPnl < 0 ? 'text-rose-300' : 'text-emerald-300'
+                          }`}
+                      >
+                        {formatSignedNumber(executionTotalUnrealizedPnl, 8)}
+                      </div>
+                    </div>
+                    <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                      <div className="text-slate-500">주문 심볼 노출액</div>
+                      <div className="text-slate-200 font-mono">
+                        {formatNullableNumber(executionPrimaryPositionNotional, 4)}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                    <div className="border border-slate-800 rounded-lg overflow-hidden">
+                      <div className="px-3 py-2 text-xs text-slate-400 bg-slate-950/50 border-b border-slate-800">
+                        자산별 잔고
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead>
+                            <tr className="text-slate-500 border-b border-slate-800">
+                              <th className="py-2 px-3 text-left">자산</th>
+                              <th className="py-2 px-3 text-right">총</th>
+                              <th className="py-2 px-3 text-right">가용</th>
+                              <th className="py-2 px-3 text-right">사용</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(executionPortfolio?.walletBalances ?? []).length === 0 ? (
+                              <tr>
+                                <td colSpan={4} className="py-4 text-center text-slate-500">
+                                  표시할 잔고가 없습니다.
+                                </td>
+                              </tr>
+                            ) : (
+                              (executionPortfolio?.walletBalances ?? []).map((item) => (
+                                <tr key={item.asset} className="border-b border-slate-900/70">
+                                  <td className="py-2 px-3 text-slate-300 font-medium">{item.asset}</td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">
+                                    {formatNullableNumber(item.total, 8)}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">
+                                    {formatNullableNumber(item.free, 8)}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">
+                                    {formatNullableNumber(item.used, 8)}
+                                  </td>
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="border border-slate-800 rounded-lg overflow-hidden">
+                      <div className="px-3 py-2 text-xs text-slate-400 bg-slate-950/50 border-b border-slate-800">
+                        활성 포지션
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead>
+                            <tr className="text-slate-500 border-b border-slate-800">
+                              <th className="py-2 px-3 text-left">심볼</th>
+                              <th className="py-2 px-3 text-left">방향</th>
+                              <th className="py-2 px-3 text-right">수량</th>
+                              <th className="py-2 px-3 text-right">미실현손익</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(executionPortfolio?.positions ?? []).length === 0 ? (
+                              <tr>
+                                <td colSpan={4} className="py-4 text-center text-slate-500">
+                                  열린 포지션이 없습니다.
+                                </td>
+                              </tr>
+                            ) : (
+                              (executionPortfolio?.positions ?? []).map((position) => (
+                                <tr key={`${position.symbol}-${position.side ?? 'none'}`} className="border-b border-slate-900/70">
+                                  <td className="py-2 px-3 text-slate-300 font-mono">{position.symbol}</td>
+                                  <td className={`py-2 px-3 ${(position.side ?? '').toLowerCase() === 'short' ? 'text-emerald-300' : 'text-indigo-300'}`}>
+                                    {position.side ? position.side.toUpperCase() : '-'}
+                                  </td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">
+                                    {formatNullableNumber(position.contracts, 8)}
+                                  </td>
+                                  <td
+                                    className={`py-2 px-3 text-right font-mono ${position.unrealizedPnl != null && position.unrealizedPnl < 0 ? 'text-rose-300' : 'text-emerald-300'
+                                      }`}
+                                  >
+                                    {formatSignedNumber(position.unrealizedPnl, 8)}
+                                  </td>
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {(isPortfolioTab || isAutomationTab) && (
+                <div className="lg:col-span-12 grid grid-cols-1 xl:grid-cols-2 gap-6">
+                  <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-semibold text-slate-200">실제 체결 내역 (최근)</h3>
+                      <button
+                        onClick={() => void refreshExecutionData(true)}
+                        className="text-[11px] px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700"
+                      >
+                        갱신
+                      </button>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-xs">
+                        <thead>
+                          <tr className="text-slate-400 border-b border-slate-800">
+                            <th className="py-2 pr-2 text-left">시간</th>
+                            <th className="py-2 pr-2 text-left">구분</th>
+                            <th className="py-2 pr-2 text-right">김프%</th>
+                            <th className="py-2 pr-2 text-right">실질김프%</th>
+                            <th className="py-2 pr-2 text-right">USDT/KRW</th>
+                            <th className="py-2 pr-2 text-right">수량</th>
+                            <th className="py-2 pr-2 text-right">가격</th>
+                            <th className="py-2 text-right">PNL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {executionFills.length === 0 ? (
+                            <tr>
+                              <td colSpan={8} className="py-4 text-center text-slate-500">
+                                체결 내역이 없습니다.
+                              </td>
+                            </tr>
+                          ) : (
+                            executionFills.slice(0, 12).map((fill, index) => (
+                              <tr key={`${fill.id ?? 'fill'}-${index}`} className="border-b border-slate-900/70">
+                                <td className="py-2 pr-2 text-slate-300">
+                                  {fill.timestamp ? new Date(fill.timestamp).toLocaleString('ko-KR') : '-'}
+                                </td>
+                                <td className={`py-2 pr-2 ${fill.side === 'buy' ? 'text-indigo-300' : 'text-emerald-300'}`}>
+                                  {fill.strategyContext?.action === 'ENTRY_SELL'
+                                    ? '진입(SELL)'
+                                    : fill.strategyContext?.action === 'EXIT_BUY'
+                                      ? '청산(BUY)'
+                                      : fill.side === 'sell'
+                                        ? '진입(SELL)'
+                                        : fill.side === 'buy'
+                                          ? '청산(BUY)'
+                                          : '-'}
+                                </td>
+                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                  {fill.strategyContext?.premiumPct != null
+                                    ? `${fill.strategyContext.premiumPct.toFixed(2)}%`
+                                    : '-'}
+                                </td>
+                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                  {fill.strategyContext?.effectivePremiumPct != null
+                                    ? `${fill.strategyContext.effectivePremiumPct.toFixed(2)}%`
+                                    : '-'}
+                                </td>
+                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                  {fill.strategyContext?.usdtKrwRate != null
+                                    ? fill.strategyContext.usdtKrwRate.toFixed(2)
+                                    : '-'}
+                                </td>
+                                <td className="py-2 pr-2 text-right font-mono text-slate-300">{fill.amount ?? '-'}</td>
+                                <td className="py-2 pr-2 text-right font-mono text-slate-300">{fill.price ?? '-'}</td>
+                                <td className="py-2 text-right font-mono text-slate-300">{fill.realizedPnl ?? '-'}</td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-semibold text-slate-200">실행 이벤트 로그</h3>
+                      <button
+                        onClick={() => void refreshExecutionData(true)}
+                        className="text-[11px] px-2 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300 hover:bg-slate-700"
+                      >
+                        갱신
+                      </button>
+                    </div>
+                    <div className="space-y-2 max-h-[300px] overflow-y-auto">
+                      {executionEvents.length === 0 ? (
+                        <div className="text-xs text-slate-500 py-6 text-center">이벤트가 없습니다.</div>
+                      ) : (
+                        executionEvents.slice(0, 20).map((event, index) => (
+                          <div key={`${event.event}-${event.timestamp}-${index}`} className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className={`text-[11px] font-semibold ${event.level === 'error' ? 'text-rose-300' : event.level === 'warn' ? 'text-amber-300' : 'text-emerald-300'}`}>
+                                {event.event}
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                {event.timestamp ? new Date(event.timestamp).toLocaleString('ko-KR') : '-'}
+                              </span>
+                            </div>
+                            {typeof event.error === 'string' && (
+                              <div className="text-[11px] text-rose-200 mt-1 break-all">{event.error}</div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
-
-            {/* Trade Logs */}
-            <LogPanel logs={logs} />
           </div>
-
         </div>
-      </div>
+      </main>
     </div>
   );
 };
