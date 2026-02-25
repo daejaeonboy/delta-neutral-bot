@@ -146,6 +146,9 @@ function normalizeMarketPayload(payload: any): MarketData {
     const kimchiPremiumPercentUsdt = toFiniteNumber(payload?.kimchiPremiumPercentUsdt) ?? undefined;
     const usdtPremiumPercent = toFiniteNumber(payload?.usdtPremiumPercent) ?? undefined;
     const fxCacheAgeMs = toFiniteNumber(payload?.fxCacheAgeMs);
+    const btcSource = typeof payload?.btcSource === 'string' ? payload.btcSource : undefined;
+    const globalSource = typeof payload?.globalSource === 'string' ? payload.globalSource : undefined;
+    const exchangeRateSource = typeof payload?.exchangeRateSource === 'string' ? payload.exchangeRateSource : undefined;
     const sources =
         payload?.sources &&
             typeof payload.sources.domestic === 'string' &&
@@ -158,8 +161,11 @@ function normalizeMarketPayload(payload: any): MarketData {
     return {
         timestamp,
         krwPrice,
+        btcSource,
         usdPrice,
+        globalSource,
         exchangeRate,
+        exchangeRateSource,
         usdtKrwRate,
         conversionRate,
         normalizedGlobalKrwPrice,
@@ -1806,9 +1812,18 @@ export const stopExecutionEngine = async (
 
 // --- Discord Config API ---
 
+export interface DiscordNotificationSettings {
+    premiumAlertEnabled: boolean;
+    premiumAlertThresholdHigh: number;
+    premiumAlertThresholdLow: number;
+    periodicReportEnabled: boolean;
+    reportIntervalMinutes: number;
+}
+
 export interface DiscordConfigResponse {
     configured: boolean;
     webhookUrlMasked: string;
+    notifications: DiscordNotificationSettings;
 }
 
 export const fetchDiscordConfig = async (): Promise<DiscordConfigResponse> => {
@@ -1818,22 +1833,39 @@ export const fetchDiscordConfig = async (): Promise<DiscordConfigResponse> => {
         (p: any) => ({
             configured: Boolean(p?.configured),
             webhookUrlMasked: typeof p?.webhookUrlMasked === 'string' ? p.webhookUrlMasked : '',
+            notifications: {
+                premiumAlertEnabled: Boolean(p?.notifications?.premiumAlertEnabled),
+                premiumAlertThresholdHigh: Number(p?.notifications?.premiumAlertThresholdHigh ?? 3.0),
+                premiumAlertThresholdLow: Number(p?.notifications?.premiumAlertThresholdLow ?? -1.0),
+                periodicReportEnabled: p?.notifications?.periodicReportEnabled !== false,
+                reportIntervalMinutes: Number(p?.notifications?.reportIntervalMinutes ?? 60),
+            },
         }),
         { allowFallback: false }
     );
 };
 
-export const updateDiscordConfig = async (webhookUrl: string): Promise<{ configured: boolean; message: string }> => {
+export const updateDiscordConfig = async (
+    webhookUrl: string,
+    notifications?: Partial<DiscordNotificationSettings>
+): Promise<{ configured: boolean; message: string; notifications: DiscordNotificationSettings }> => {
     return await fetchApi(
         '/api/discord/config',
         'Discord config update API',
         (p: any) => ({
             configured: Boolean(p?.configured),
             message: typeof p?.message === 'string' ? p.message : '',
+            notifications: {
+                premiumAlertEnabled: Boolean(p?.notifications?.premiumAlertEnabled),
+                premiumAlertThresholdHigh: Number(p?.notifications?.premiumAlertThresholdHigh ?? 3.0),
+                premiumAlertThresholdLow: Number(p?.notifications?.premiumAlertThresholdLow ?? -1.0),
+                periodicReportEnabled: p?.notifications?.periodicReportEnabled !== false,
+                reportIntervalMinutes: Number(p?.notifications?.reportIntervalMinutes ?? 60),
+            },
         }),
         {
             method: 'POST',
-            body: { webhookUrl },
+            body: { webhookUrl, notifications },
             allowFallback: false,
         }
     );

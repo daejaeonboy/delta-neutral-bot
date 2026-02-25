@@ -12,8 +12,11 @@ export enum Side {
 export interface MarketData {
   timestamp: number;
   krwPrice: number; // Domestic Price
-  usdPrice: number; // International Price (BTC/USDT)
+  btcSource?: string;
+  usdPrice: number; // International Price (BTC/USDT or BTC/USD)
+  globalSource?: string;
   exchangeRate: number; // USD/KRW
+  exchangeRateSource?: string;
   usdtKrwRate?: number; // KRW/USDT
   conversionRate?: number; // Conversion rate used in kimchi premium calculation
   normalizedGlobalKrwPrice?: number; // usdPrice * conversionRate

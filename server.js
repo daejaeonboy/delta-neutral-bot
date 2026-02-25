@@ -62,6 +62,16 @@ const binanceRecvWindowMs =
         : 5000;
 const executionAlertWebhookUrl = (process.env.EXECUTION_ALERT_WEBHOOK_URL ?? '').trim();
 let discordWebhookUrl = (process.env.DISCORD_WEBHOOK_URL ?? '').trim();
+const discordNotificationSettings = {
+    premiumAlertEnabled: false,
+    premiumAlertThresholdHigh: 3.0,
+    premiumAlertThresholdLow: -1.0,
+    periodicReportEnabled: true,
+    reportIntervalMinutes: 60,
+};
+let discordPeriodicReportTimer = null;
+let lastPremiumAlertAt = 0;
+const PREMIUM_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 const parsedExecutionAlertTimeoutMs = Number(process.env.EXECUTION_ALERT_TIMEOUT_MS);
 const executionAlertTimeoutMs =
     Number.isFinite(parsedExecutionAlertTimeoutMs) && parsedExecutionAlertTimeoutMs >= 1000
@@ -2023,6 +2033,46 @@ async function runExecutionEngineTick() {
         );
         executionEngineState.lastError = null;
 
+        // --- Premium threshold Discord alert ---
+        if (
+            discordWebhookUrl &&
+            discordNotificationSettings.premiumAlertEnabled &&
+            Number.isFinite(premiumValue)
+        ) {
+            const now = Date.now();
+            const highThreshold = discordNotificationSettings.premiumAlertThresholdHigh;
+            const lowThreshold = discordNotificationSettings.premiumAlertThresholdLow;
+            let alertTitle = null;
+            let alertColor = 0;
+
+            if (Number.isFinite(highThreshold) && premiumValue >= highThreshold) {
+                alertTitle = `🔺 김프 상한 알림 (${round(premiumValue, 2)}% ≥ ${round(highThreshold, 2)}%)`;
+                alertColor = 0xef4444;
+            } else if (Number.isFinite(lowThreshold) && premiumValue <= lowThreshold) {
+                alertTitle = `🔻 김프 하한 알림 (${round(premiumValue, 2)}% ≤ ${round(lowThreshold, 2)}%)`;
+                alertColor = 0x3b82f6;
+            }
+
+            if (alertTitle && now - lastPremiumAlertAt >= PREMIUM_ALERT_COOLDOWN_MS) {
+                lastPremiumAlertAt = now;
+                const savedCooldown = lastDiscordNotificationAt;
+                lastDiscordNotificationAt = 0;
+                void sendDiscordNotification({
+                    title: alertTitle,
+                    description: '설정한 김프 임계값을 돌파했습니다.',
+                    color: alertColor,
+                    fields: [
+                        { name: '현재 김프 (USD)', value: `${round(premiumValue, 4)}%` },
+                        { name: '김프 (USDT)', value: `${round(marketSnapshot.kimchiPremiumPercentUsdt, 4)}%` },
+                        { name: 'BTC/KRW', value: `₩${Math.round(marketSnapshot.krwPrice).toLocaleString()}` },
+                        { name: 'BTC/USD', value: `$${round(marketSnapshot.usdPrice, 2).toLocaleString()}` },
+                        { name: '상한 임계', value: `${round(highThreshold, 2)}%` },
+                        { name: '하한 임계', value: `${round(lowThreshold, 2)}%` },
+                    ],
+                }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+            }
+        }
+
         if (!Number.isFinite(premiumValue)) {
             throw new Error('premium value is not available');
         }
@@ -2508,6 +2558,34 @@ async function fetchUpbitBtcAndUsdtKrw() {
     return { btcKrw, usdtKrw };
 }
 
+async function fetchBithumbBtcKrw() {
+    const data = await fetchJson('https://api.bithumb.com/public/ticker/BTC_KRW', {
+        context: 'bithumb-btc',
+    });
+    const btcKrw = toFiniteNumber(data?.data?.closing_price);
+
+    if (!Number.isFinite(btcKrw) || btcKrw <= 0) {
+        throw new Error('Invalid BTC_KRW price from Bithumb');
+    }
+
+    return btcKrw;
+}
+
+async function fetchBinanceCoinMBtcUsd() {
+    // COIN-M Perpetual: BTCUSD_PERP
+    // Note: dapi returns an array even for single symbol queries
+    const data = await fetchJson('https://dapi.binance.com/dapi/v1/ticker/price?symbol=BTCUSD_PERP', {
+        context: 'binance-coinm-btc',
+    });
+    const price = toFiniteNumber(Array.isArray(data) ? data[0]?.price : data?.price);
+
+    if (!Number.isFinite(price) || price <= 0) {
+        throw new Error('Invalid BTCUSD_PERP price from Binance COIN-M');
+    }
+
+    return price;
+}
+
 async function fetchBinanceBtcUsdt() {
     const data = await fetchJson('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
     const btcUsdt = toFiniteNumber(data?.price);
@@ -2924,6 +3002,7 @@ async function fetchBybitCandles({ interval, limit }) {
 
 async function fetchGlobalBtcUsdt() {
     const providers = [
+        { source: 'binance:COIN-M', fetcher: fetchBinanceCoinMBtcUsd },
         { source: 'binance:BTCUSDT', fetcher: fetchBinanceBtcUsdt },
         { source: 'bybit:BTCUSDT', fetcher: fetchBybitBtcUsdt },
         { source: 'kraken:BTCUSDT', fetcher: fetchKrakenBtcUsdt },
@@ -3733,13 +3812,17 @@ loadPremiumHistoryFromDisk();
 app.get('/api/ticker', async (req, res) => {
     const startedAt = Date.now();
     try {
-        const [upbit, globalTicker, fxRate] = await Promise.all([
+        const [upbit, globalTicker, fxRate, bithumbPrice] = await Promise.all([
             fetchUpbitBtcAndUsdtKrw(),
             fetchGlobalBtcUsdt(),
             getUsdKrwRate(),
+            fetchBithumbBtcKrw().catch(() => null),
         ]);
 
-        const krwPrice = upbit.btcKrw;
+        // Primary domestic price: Bithumb (fallback to Upbit)
+        const krwPrice = bithumbPrice ?? upbit.btcKrw;
+        const domesticSource = bithumbPrice ? 'bithumb:BTC_KRW' : 'upbit:KRW-BTC';
+
         const usdPrice = globalTicker.price;
         const exchangeRate = fxRate.usdKrw;
         const usdtKrwRate = upbit.usdtKrw;
@@ -3769,7 +3852,7 @@ app.get('/api/ticker', async (req, res) => {
             usdtPremiumPercent: round(usdtPremiumPercent, 4),
             fxCacheAgeMs: fxRate.fetchedAt > 0 ? Date.now() - fxRate.fetchedAt : null,
             sources: {
-                domestic: 'upbit:KRW-BTC',
+                domestic: domesticSource,
                 global: globalTicker.source,
                 fx: fxRate.source,
                 conversion: fxRate.source,
@@ -4690,9 +4773,83 @@ try {
         if (typeof saved.webhookUrl === 'string' && saved.webhookUrl.trim()) {
             discordWebhookUrl = saved.webhookUrl.trim();
         }
+        if (saved.notifications && typeof saved.notifications === 'object') {
+            const n = saved.notifications;
+            if (typeof n.premiumAlertEnabled === 'boolean') discordNotificationSettings.premiumAlertEnabled = n.premiumAlertEnabled;
+            if (Number.isFinite(Number(n.premiumAlertThresholdHigh))) discordNotificationSettings.premiumAlertThresholdHigh = Number(n.premiumAlertThresholdHigh);
+            if (Number.isFinite(Number(n.premiumAlertThresholdLow))) discordNotificationSettings.premiumAlertThresholdLow = Number(n.premiumAlertThresholdLow);
+            if (typeof n.periodicReportEnabled === 'boolean') discordNotificationSettings.periodicReportEnabled = n.periodicReportEnabled;
+            if (Number.isFinite(Number(n.reportIntervalMinutes)) && Number(n.reportIntervalMinutes) >= 10) discordNotificationSettings.reportIntervalMinutes = Number(n.reportIntervalMinutes);
+        }
     }
 } catch (e) {
     console.warn('Failed to restore discord config:', e.message);
+}
+
+function getDiscordNotificationSettingsSummary() {
+    return {
+        premiumAlertEnabled: discordNotificationSettings.premiumAlertEnabled,
+        premiumAlertThresholdHigh: discordNotificationSettings.premiumAlertThresholdHigh,
+        premiumAlertThresholdLow: discordNotificationSettings.premiumAlertThresholdLow,
+        periodicReportEnabled: discordNotificationSettings.periodicReportEnabled,
+        reportIntervalMinutes: discordNotificationSettings.reportIntervalMinutes,
+    };
+}
+
+function persistDiscordConfig() {
+    try {
+        if (!fs.existsSync(runtimeStateDir)) fs.mkdirSync(runtimeStateDir, { recursive: true });
+        fs.writeFileSync(discordConfigStateFile, JSON.stringify({
+            webhookUrl: discordWebhookUrl,
+            notifications: getDiscordNotificationSettingsSummary(),
+            updatedAt: Date.now(),
+        }), 'utf8');
+    } catch (e) {
+        console.error('Failed to persist discord config:', e.message);
+    }
+}
+
+function restartDiscordPeriodicReportTimer() {
+    if (discordPeriodicReportTimer) {
+        clearInterval(discordPeriodicReportTimer);
+        discordPeriodicReportTimer = null;
+    }
+
+    if (!discordWebhookUrl || !discordNotificationSettings.periodicReportEnabled) {
+        return;
+    }
+
+    const intervalMs = Math.max(10, discordNotificationSettings.reportIntervalMinutes) * 60 * 1000;
+
+    discordPeriodicReportTimer = setInterval(async () => {
+        if (!discordWebhookUrl || !discordNotificationSettings.periodicReportEnabled) return;
+
+        try {
+            const snapshot = await fetchExecutionEngineMarketSnapshot();
+            const premium = round(snapshot.kimchiPremiumPercent, 4);
+            const premiumUsdt = round(snapshot.kimchiPremiumPercentUsdt, 4);
+            const running = executionEngineState.running;
+            const posState = executionEngineState.positionState;
+
+            // 정기 보고는 쿨다운 무시
+            lastDiscordNotificationAt = 0;
+            void sendDiscordNotification({
+                title: '📊 김프 정기 보고',
+                description: '현재 BTC 김치프리미엄 현황',
+                color: 0x6366f1,
+                fields: [
+                    { name: '김프 (USD)', value: `${premium}%` },
+                    { name: '김프 (USDT)', value: `${premiumUsdt}%` },
+                    { name: 'BTC/KRW', value: `₩${Math.round(snapshot.krwPrice).toLocaleString()}` },
+                    { name: 'BTC/USD', value: `$${round(snapshot.usdPrice, 2).toLocaleString()}` },
+                    { name: 'USD/KRW', value: `₩${round(snapshot.exchangeRate, 2)}` },
+                    { name: '엔진', value: running ? `🟢 ${posState}` : '⏹️ 정지' },
+                ],
+            });
+        } catch (err) {
+            console.error(`Discord periodic report failed: ${toErrorMessage(err)}`);
+        }
+    }, intervalMs);
 }
 
 app.get('/api/discord/config', (req, res) => {
@@ -4703,28 +4860,43 @@ app.get('/api/discord/config', (req, res) => {
     res.json({
         configured: url.length > 0,
         webhookUrlMasked: masked,
+        notifications: getDiscordNotificationSettingsSummary(),
     });
 });
 
 app.post('/api/discord/config', express.json(), (req, res) => {
-    const { webhookUrl } = req.body ?? {};
+    const body = req.body ?? {};
+    const { webhookUrl } = body;
     if (typeof webhookUrl !== 'string') {
         return res.status(400).json({ error: 'webhookUrl is required' });
     }
 
-    discordWebhookUrl = webhookUrl.trim();
-
-    // Persist to .runtime
-    try {
-        if (!fs.existsSync(runtimeStateDir)) fs.mkdirSync(runtimeStateDir, { recursive: true });
-        fs.writeFileSync(discordConfigStateFile, JSON.stringify({ webhookUrl: discordWebhookUrl, updatedAt: Date.now() }), 'utf8');
-    } catch (e) {
-        console.error('Failed to persist discord config:', e.message);
+    // __KEEP__ means preserve existing webhook URL (only updating notification settings)
+    if (webhookUrl.trim() !== '__KEEP__') {
+        discordWebhookUrl = webhookUrl.trim();
     }
+
+    // Update notification settings if provided
+    if (body.notifications && typeof body.notifications === 'object') {
+        const n = body.notifications;
+        if (typeof n.premiumAlertEnabled === 'boolean') discordNotificationSettings.premiumAlertEnabled = n.premiumAlertEnabled;
+        if (Number.isFinite(Number(n.premiumAlertThresholdHigh))) discordNotificationSettings.premiumAlertThresholdHigh = Number(n.premiumAlertThresholdHigh);
+        if (Number.isFinite(Number(n.premiumAlertThresholdLow))) discordNotificationSettings.premiumAlertThresholdLow = Number(n.premiumAlertThresholdLow);
+        if (typeof n.periodicReportEnabled === 'boolean') discordNotificationSettings.periodicReportEnabled = n.periodicReportEnabled;
+        if (Number.isFinite(Number(n.reportIntervalMinutes)) && Number(n.reportIntervalMinutes) >= 10) {
+            discordNotificationSettings.reportIntervalMinutes = Number(n.reportIntervalMinutes);
+        }
+    }
+
+    persistDiscordConfig();
+
+    // Restart periodic report timer with new settings
+    restartDiscordPeriodicReportTimer();
 
     res.json({
         configured: discordWebhookUrl.length > 0,
         message: discordWebhookUrl ? 'Discord webhook URL updated' : 'Discord webhook URL cleared',
+        notifications: getDiscordNotificationSettingsSummary(),
     });
 });
 
@@ -5952,36 +6124,8 @@ app.listen(port, () => {
         console.log('Discord webhook configured.');
     }
 
-    // 1시간 간격 김프 정기 보고
-    if (discordWebhookUrl) {
-        setInterval(async () => {
-            try {
-                const snapshot = await fetchExecutionEngineMarketSnapshot();
-                const premium = round(snapshot.kimchiPremiumPercent, 4);
-                const premiumUsdt = round(snapshot.kimchiPremiumPercentUsdt, 4);
-                const running = executionEngineState.running;
-                const posState = executionEngineState.positionState;
-
-                // 정기 보고는 쿨다운 무시
-                lastDiscordNotificationAt = 0;
-                void sendDiscordNotification({
-                    title: '📊 김프 정기 보고',
-                    description: '현재 BTC 김치프리미엄 현황',
-                    color: 0x6366f1,
-                    fields: [
-                        { name: '김프 (USD)', value: `${premium}%` },
-                        { name: '김프 (USDT)', value: `${premiumUsdt}%` },
-                        { name: 'BTC/KRW', value: `₩${Math.round(snapshot.krwPrice).toLocaleString()}` },
-                        { name: 'BTC/USD', value: `$${round(snapshot.usdPrice, 2).toLocaleString()}` },
-                        { name: 'USD/KRW', value: `₩${round(snapshot.exchangeRate, 2)}` },
-                        { name: '엔진', value: running ? `🟢 ${posState}` : '⏹️ 정지' },
-                    ],
-                });
-            } catch (err) {
-                console.error(`Discord hourly report failed: ${toErrorMessage(err)}`);
-            }
-        }, 60 * 60 * 1000);
-    }
+    // 김프 정기 보고 (configurable interval)
+    restartDiscordPeriodicReportTimer();
 
     const shouldAutoStartFromEnv = executionEngineAutoStart;
     const shouldRecoverFromState = !shouldAutoStartFromEnv && executionEngineState.desiredRunning;

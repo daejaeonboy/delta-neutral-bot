@@ -39,6 +39,7 @@ import {
   updateDiscordConfig,
   sendDiscordTest,
   DiscordConfigResponse,
+  DiscordNotificationSettings,
 } from './services/marketService';
 
 const POLLING_INTERVAL_MS = 3000;
@@ -90,6 +91,12 @@ const App: React.FC = () => {
   const [discordWebhookInput, setDiscordWebhookInput] = useState<string>('');
   const [isDiscordSubmitting, setIsDiscordSubmitting] = useState<boolean>(false);
   const [discordMessage, setDiscordMessage] = useState<string | null>(null);
+  // Discord notification settings state
+  const [premiumAlertEnabled, setPremiumAlertEnabled] = useState<boolean>(false);
+  const [premiumAlertThresholdHigh, setPremiumAlertThresholdHigh] = useState<number>(3.0);
+  const [premiumAlertThresholdLow, setPremiumAlertThresholdLow] = useState<number>(-1.0);
+  const [periodicReportEnabled, setPeriodicReportEnabled] = useState<boolean>(true);
+  const [reportIntervalMinutes, setReportIntervalMinutes] = useState<number>(60);
 
   const pollingRef = useRef<number | null>(null);
   const executionPollingRef = useRef<number | null>(null);
@@ -292,8 +299,15 @@ const App: React.FC = () => {
   useEffect(() => {
     void (async () => {
       try {
-        const config = await fetchDiscordConfig();
-        setDiscordConfig(config);
+        const cfg = await fetchDiscordConfig();
+        setDiscordConfig(cfg);
+        if (cfg.notifications) {
+          setPremiumAlertEnabled(cfg.notifications.premiumAlertEnabled);
+          setPremiumAlertThresholdHigh(cfg.notifications.premiumAlertThresholdHigh);
+          setPremiumAlertThresholdLow(cfg.notifications.premiumAlertThresholdLow);
+          setPeriodicReportEnabled(cfg.notifications.periodicReportEnabled);
+          setReportIntervalMinutes(cfg.notifications.reportIntervalMinutes);
+        }
       } catch { /* silent */ }
     })();
   }, []);
@@ -663,7 +677,7 @@ const App: React.FC = () => {
                     <MetricCard
                       title="BTC 김프 (USD)"
                       value={`${currentData.kimchiPremiumPercent.toFixed(2)}%`}
-                      subValue={`${currentData.exchangeRate.toFixed(1)} USD/KRW`}
+                      subValue={`리얼환율: ${currentData.exchangeRate.toFixed(1)}`}
                       trend={currentData.kimchiPremiumPercent > 0 ? 'up' : 'down'}
                       icon={<Zap size={16} strokeWidth={2.5} />}
                       highlight={currentData.kimchiPremiumPercent > (config.entryThreshold || 3)}
@@ -678,13 +692,13 @@ const App: React.FC = () => {
                     <MetricCard
                       title="국내 시세 (KRW)"
                       value={`₩${Math.round(currentData.krwPrice / 10000).toLocaleString()}만`}
-                      subValue={`${currentData.sources?.domestic?.split(':')[1] ?? 'BTC-KRW'}`}
+                      subValue={`${currentData.btcSource ?? 'Bithumb'}`}
                       icon={<TrendingUp size={16} />}
                     />
                     <MetricCard
-                      title="해외 시세 (USDT)"
+                      title="해외 시세 (USD)"
                       value={`$${(currentData.usdPrice).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
-                      subValue={`${currentData.sources?.global?.split(':')[1] ?? 'BTC-USDT'}`}
+                      subValue={`${currentData.globalSource ?? 'Binance COIN-M'}`}
                       icon={<Activity size={16} />}
                     />
                     <MetricCard
@@ -698,9 +712,9 @@ const App: React.FC = () => {
 
                 {isAutomationTab && (
                   <div className="bg-slate-900/40 border border-slate-800 rounded-xl px-4 py-3 text-xs flex flex-col md:flex-row justify-between gap-2 text-slate-400">
-                    <span>해외 환산가 (USD 기준): ₩{normalizedGlobalKrwPrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                    <span>USDT/KRW: {currentData.usdtKrwRate?.toFixed(2) ?? '-'} · USD/KRW: {currentData.exchangeRate.toFixed(2)}</span>
-                    <span>마지막 성공 갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
+                    <span>해외 환산가: ₩{normalizedGlobalKrwPrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                    <span className="text-emerald-400/80 font-medium">USD/KRW 환율: {currentData.exchangeRate.toFixed(2)} · USDT/KRW (테더): {currentData.usdtKrwRate?.toFixed(2) ?? '-'}</span>
+                    <span>갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
                   </div>
                 )}
 
@@ -812,7 +826,7 @@ const App: React.FC = () => {
 
                     {/* Discord Webhook Config */}
                     <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
-                      <h3 className="text-lg font-semibold text-slate-200 mb-4">디스코드 알림 설정</h3>
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">디스코드 웹훅 설정</h3>
                       <div className="space-y-3">
                         <div className="text-[11px] text-slate-500">
                           상태: {discordConfig?.configured ? '✅ 연결됨' : '❌ 미설정'}
@@ -833,7 +847,7 @@ const App: React.FC = () => {
                               setDiscordMessage(null);
                               try {
                                 const result = await updateDiscordConfig(discordWebhookInput.trim());
-                                setDiscordConfig({ configured: result.configured, webhookUrlMasked: '' });
+                                setDiscordConfig({ configured: result.configured, webhookUrlMasked: '', notifications: result.notifications });
                                 setDiscordMessage(result.message);
                                 setDiscordWebhookInput('');
                                 const fresh = await fetchDiscordConfig();
@@ -873,8 +887,14 @@ const App: React.FC = () => {
                                 setIsDiscordSubmitting(true);
                                 setDiscordMessage(null);
                                 try {
-                                  const result = await updateDiscordConfig('');
-                                  setDiscordConfig({ configured: result.configured, webhookUrlMasked: '' });
+                                  const result = await updateDiscordConfig('', {
+                                    premiumAlertEnabled,
+                                    premiumAlertThresholdHigh,
+                                    premiumAlertThresholdLow,
+                                    periodicReportEnabled,
+                                    reportIntervalMinutes,
+                                  });
+                                  setDiscordConfig({ configured: result.configured, webhookUrlMasked: '', notifications: result.notifications });
                                   setDiscordMessage('웹훅 URL 삭제됨');
                                 } catch (e) {
                                   setDiscordMessage(e instanceof Error ? e.message : '오류');
@@ -897,8 +917,126 @@ const App: React.FC = () => {
                         <div className="text-[10px] text-slate-600 space-y-1">
                           <p>🔴 판매 체결 / 🟢 매수 체결 알림</p>
                           <p>▶️ 엔진 시작 / ⏹️ 엔진 정지 알림</p>
-                          <p>📊 1시간 간격 김프 정기 보고</p>
                         </div>
+                      </div>
+                    </div>
+
+                    {/* Discord Notification Settings */}
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">디스코드 알림 설정</h3>
+                      <div className="space-y-4">
+
+                        {/* 김프 임계값 알림 */}
+                        <div className="space-y-2">
+                          <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={premiumAlertEnabled}
+                              onChange={(e) => setPremiumAlertEnabled(e.target.checked)}
+                              className="accent-indigo-500 w-4 h-4 rounded border-slate-700 bg-slate-800"
+                            />
+                            🔔 김프 임계값 알림
+                          </label>
+                          {premiumAlertEnabled && (
+                            <div className="ml-6 space-y-2">
+                              <div className="grid grid-cols-2 gap-2">
+                                <label className="text-slate-400 flex flex-col gap-1 text-xs">
+                                  🔺 상한 김프 (%)
+                                  <input
+                                    type="number"
+                                    step={0.1}
+                                    value={premiumAlertThresholdHigh}
+                                    onChange={(e) => setPremiumAlertThresholdHigh(Number(e.target.value))}
+                                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-indigo-500 outline-none"
+                                  />
+                                </label>
+                                <label className="text-slate-400 flex flex-col gap-1 text-xs">
+                                  🔻 하한 김프 (%)
+                                  <input
+                                    type="number"
+                                    step={0.1}
+                                    value={premiumAlertThresholdLow}
+                                    onChange={(e) => setPremiumAlertThresholdLow(Number(e.target.value))}
+                                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-indigo-500 outline-none"
+                                  />
+                                </label>
+                              </div>
+                              <p className="text-[10px] text-slate-600">
+                                김프가 상한 이상 또는 하한 이하가 되면 디스코드로 알림을 보냅니다. (쿨다운: 10분)
+                              </p>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 정기 보고 설정 */}
+                        <div className="space-y-2">
+                          <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={periodicReportEnabled}
+                              onChange={(e) => setPeriodicReportEnabled(e.target.checked)}
+                              className="accent-indigo-500 w-4 h-4 rounded border-slate-700 bg-slate-800"
+                            />
+                            📊 김프 정기 보고
+                          </label>
+                          {periodicReportEnabled && (
+                            <div className="ml-6">
+                              <label className="text-slate-400 flex flex-col gap-1 text-xs">
+                                보고 간격
+                                <select
+                                  value={reportIntervalMinutes}
+                                  onChange={(e) => setReportIntervalMinutes(Number(e.target.value))}
+                                  className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 focus:ring-1 focus:ring-indigo-500 outline-none"
+                                >
+                                  <option value={30}>30분</option>
+                                  <option value={60}>1시간</option>
+                                  <option value={120}>2시간</option>
+                                  <option value={240}>4시간</option>
+                                  <option value={480}>8시간</option>
+                                </select>
+                              </label>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 알림 설정 저장 버튼 */}
+                        <button
+                          onClick={async () => {
+                            setIsDiscordSubmitting(true);
+                            setDiscordMessage(null);
+                            try {
+                              const webhookUrl = discordConfig?.configured
+                                ? (discordConfig.webhookUrlMasked ? '__KEEP__' : '')
+                                : '';
+                              const result = await updateDiscordConfig(
+                                webhookUrl,
+                                {
+                                  premiumAlertEnabled,
+                                  premiumAlertThresholdHigh,
+                                  premiumAlertThresholdLow,
+                                  periodicReportEnabled,
+                                  reportIntervalMinutes,
+                                }
+                              );
+                              setDiscordConfig(prev => prev ? { ...prev, notifications: result.notifications } : prev);
+                              setDiscordMessage('알림 설정이 저장되었습니다.');
+                            } catch (e) {
+                              setDiscordMessage(e instanceof Error ? e.message : '설정 저장 실패');
+                            } finally {
+                              setIsDiscordSubmitting(false);
+                            }
+                          }}
+                          disabled={isDiscordSubmitting || !discordConfig?.configured}
+                          className="w-full px-3 py-2 rounded bg-indigo-900/30 border border-indigo-800/50 text-sm font-semibold text-indigo-200 hover:bg-indigo-900/40 disabled:opacity-60 transition-colors"
+                        >
+                          {isDiscordSubmitting ? '저장 중...' : '📥 알림 설정 저장'}
+                        </button>
+
+                        {!discordConfig?.configured && (
+                          <p className="text-[10px] text-amber-400/70">
+                            ⚠️ 웹훅 URL을 먼저 설정해야 알림 기능을 사용할 수 있습니다.
+                          </p>
+                        )}
                       </div>
                     </div>
                   </div>
