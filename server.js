@@ -74,6 +74,8 @@ const discordNotificationSettings = {
     reportIntervalMinutes: 60,
 };
 let discordPeriodicReportTimer = null;
+let discordPremiumAlertTimer = null;
+let lastPremiumAlertValue = null;
 const lastPremiumAlertAtMap = {};
 const PREMIUM_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 const parsedExecutionAlertTimeoutMs = Number(process.env.EXECUTION_ALERT_TIMEOUT_MS);
@@ -2459,61 +2461,11 @@ async function runExecutionEngineTick() {
         executionEngineState.lastError = null;
 
         // --- Premium threshold Discord alert (multi-threshold) ---
-        if (
-            discordWebhookUrl &&
-            discordNotificationSettings.premiumAlertEnabled &&
-            Number.isFinite(premiumValue) &&
-            Number.isFinite(previousPremium) &&
-            Array.isArray(discordNotificationSettings.premiumAlertThresholds)
-        ) {
-            const now = Date.now();
-            for (const threshold of discordNotificationSettings.premiumAlertThresholds) {
-                if (!threshold || !Number.isFinite(threshold.value)) continue;
-                const tv = threshold.value;
-                const crossedAbove = previousPremium < tv && premiumValue >= tv;
-                const crossedBelow = previousPremium > tv && premiumValue <= tv;
-
-                // Notify only on upward crossing of threshold.
-                const aboveKey = `${threshold.id}:above`;
-                if (crossedAbove && now - (lastPremiumAlertAtMap[aboveKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
-                    lastPremiumAlertAtMap[aboveKey] = now;
-                    const savedCooldown = lastDiscordNotificationAt;
-                    lastDiscordNotificationAt = 0;
-                    const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
-                        premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
-                        premiumValue,
-                        includePremium: true,
-                        includeUsdtPremium: true,
-                    });
-                    void sendDiscordNotification({
-                        title: `🔺 김프 ${round(tv, 2)}% 이상 (${round(premiumValue, 2)}%)`,
-                        description: `김프가 ${round(tv, 2)}%를 돌파했습니다.`,
-                        color: 0xef4444,
-                        fields: marketFields,
-                    }).then(() => { lastDiscordNotificationAt = savedCooldown; });
-                }
-
-                // Notify only on downward crossing of threshold.
-                const belowKey = `${threshold.id}:below`;
-                if (crossedBelow && now - (lastPremiumAlertAtMap[belowKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
-                    lastPremiumAlertAtMap[belowKey] = now;
-                    const savedCooldown = lastDiscordNotificationAt;
-                    lastDiscordNotificationAt = 0;
-                    const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
-                        premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
-                        premiumValue,
-                        includePremium: true,
-                        includeUsdtPremium: true,
-                    });
-                    void sendDiscordNotification({
-                        title: `🔻 김프 ${round(tv, 2)}% 이하 (${round(premiumValue, 2)}%)`,
-                        description: `김프가 ${round(tv, 2)}% 이하로 내려갔습니다.`,
-                        color: 0x3b82f6,
-                        fields: marketFields,
-                    }).then(() => { lastDiscordNotificationAt = savedCooldown; });
-                }
-            }
-        }
+        handlePremiumThresholdAlerts({
+            marketSnapshot,
+            premiumValue,
+            previousPremium,
+        });
 
         if (!Number.isFinite(premiumValue)) {
             throw new Error('premium value is not available');
@@ -5668,6 +5620,109 @@ function restartDiscordPeriodicReportTimer() {
     }, intervalMs);
 }
 
+function handlePremiumThresholdAlerts({ marketSnapshot, premiumValue, previousPremium }) {
+    if (
+        !discordWebhookUrl ||
+        !discordNotificationSettings.premiumAlertEnabled ||
+        !Number.isFinite(premiumValue) ||
+        !Number.isFinite(previousPremium) ||
+        !Array.isArray(discordNotificationSettings.premiumAlertThresholds)
+    ) {
+        return;
+    }
+
+    const now = Date.now();
+    for (const threshold of discordNotificationSettings.premiumAlertThresholds) {
+        if (!threshold || !Number.isFinite(threshold.value)) continue;
+        const tv = threshold.value;
+        const crossedAbove = previousPremium < tv && premiumValue >= tv;
+        const crossedBelow = previousPremium > tv && premiumValue <= tv;
+
+        // Notify only on upward crossing of threshold.
+        const aboveKey = `${threshold.id}:above`;
+        if (crossedAbove && now - (lastPremiumAlertAtMap[aboveKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
+            lastPremiumAlertAtMap[aboveKey] = now;
+            const savedCooldown = lastDiscordNotificationAt;
+            lastDiscordNotificationAt = 0;
+            const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
+                premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
+                premiumValue,
+                includePremium: true,
+                includeUsdtPremium: true,
+            });
+            void sendDiscordNotification({
+                title: `🔺 김프 ${round(tv, 2)}% 이상 (${round(premiumValue, 2)}%)`,
+                description: `김프가 ${round(tv, 2)}%를 돌파했습니다.`,
+                color: 0xef4444,
+                fields: marketFields,
+            }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+        }
+
+        // Notify only on downward crossing of threshold.
+        const belowKey = `${threshold.id}:below`;
+        if (crossedBelow && now - (lastPremiumAlertAtMap[belowKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
+            lastPremiumAlertAtMap[belowKey] = now;
+            const savedCooldown = lastDiscordNotificationAt;
+            lastDiscordNotificationAt = 0;
+            const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
+                premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
+                premiumValue,
+                includePremium: true,
+                includeUsdtPremium: true,
+            });
+            void sendDiscordNotification({
+                title: `🔻 김프 ${round(tv, 2)}% 이하 (${round(premiumValue, 2)}%)`,
+                description: `김프가 ${round(tv, 2)}% 이하로 내려갔습니다.`,
+                color: 0x3b82f6,
+                fields: marketFields,
+            }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+        }
+    }
+}
+
+function restartDiscordPremiumAlertTimer() {
+    if (discordPremiumAlertTimer) {
+        clearInterval(discordPremiumAlertTimer);
+        discordPremiumAlertTimer = null;
+    }
+
+    // Alerts should work even if the engine is stopped.
+    const intervalMs = Math.max(2000, Math.floor(executionEnginePollIntervalMs));
+    discordPremiumAlertTimer = setInterval(async () => {
+        if (!discordWebhookUrl || !discordNotificationSettings.premiumAlertEnabled) return;
+
+        if (executionEngineState.running) {
+            if (Number.isFinite(executionEngineState.lastPremium)) {
+                lastPremiumAlertValue = executionEngineState.lastPremium;
+            }
+            return;
+        }
+
+        try {
+            const marketSnapshot = await fetchExecutionEngineMarketSnapshot();
+            const premiumValue =
+                executionEngineState.premiumBasis === 'USDT'
+                    ? marketSnapshot.kimchiPremiumPercentUsdt
+                    : marketSnapshot.kimchiPremiumPercent;
+
+            if (!Number.isFinite(premiumValue)) return;
+
+            const previousPremium = Number.isFinite(lastPremiumAlertValue)
+                ? lastPremiumAlertValue
+                : premiumValue;
+            lastPremiumAlertValue = round(premiumValue, 6);
+
+            handlePremiumThresholdAlerts({
+                marketSnapshot,
+                premiumValue,
+                previousPremium,
+            });
+        } catch (err) {
+            console.error(`Discord premium alert failed: ${toErrorMessage(err)}`);
+        }
+    }, intervalMs);
+}
+
 app.get('/api/discord/config', (req, res) => {
     const url = discordWebhookUrl;
     const masked = url
@@ -5715,6 +5770,7 @@ app.post('/api/discord/config', express.json(), (req, res) => {
 
     // Restart periodic report timer with new settings
     restartDiscordPeriodicReportTimer();
+    restartDiscordPremiumAlertTimer();
 
     res.json({
         configured: discordWebhookUrl.length > 0,
@@ -7492,6 +7548,7 @@ app.listen(port, () => {
 
     // 김프 정기 보고 (configurable interval)
     restartDiscordPeriodicReportTimer();
+    restartDiscordPremiumAlertTimer();
 
     const shouldAutoStartFromEnv = executionEngineAutoStart;
     const shouldRecoverFromState = !shouldAutoStartFromEnv && executionEngineState.desiredRunning;
