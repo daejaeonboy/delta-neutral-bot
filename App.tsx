@@ -3,7 +3,6 @@ import { Activity, Play, Pause, Zap, DollarSign, RefreshCw, TrendingUp, Plus, X,
 import { MetricCard } from './components/MetricCard';
 import {
   BithumbExecutionPortfolioResponse,
-  BithumbExecutionFill,
   ExecutionCredentialsStatusResponse,
   ExecutionEngineReadinessResponse,
   BinanceExecutionFill,
@@ -25,7 +24,6 @@ import {
   fetchExecutionEngineStatus,
   fetchExecutionEngineReadiness,
   fetchExecutionFills,
-  fetchBithumbExecutionFills,
   fetchExecutionPortfolio,
   fetchBithumbExecutionPortfolio,
   fetchExecutionPosition,
@@ -77,7 +75,6 @@ const App: React.FC = () => {
   const [executionPortfolio, setExecutionPortfolio] = useState<BinanceExecutionPortfolioResponse | null>(null);
   const [bithumbPortfolio, setBithumbPortfolio] = useState<BithumbExecutionPortfolioResponse | null>(null);
   const [executionFills, setExecutionFills] = useState<BinanceExecutionFill[]>([]);
-  const [bithumbExecutionFills, setBithumbExecutionFills] = useState<BithumbExecutionFill[]>([]);
   const [executionEvents, setExecutionEvents] = useState<ExecutionEventsResponse['events']>([]);
   const [executionEngineStatus, setExecutionEngineStatus] = useState<ExecutionEngineStatusResponse | null>(null);
   const [executionReadiness, setExecutionReadiness] = useState<ExecutionEngineReadinessResponse | null>(null);
@@ -181,10 +178,6 @@ const App: React.FC = () => {
           symbol: executionSymbol.trim(),
           limit: 20,
         }),
-        fetchBithumbExecutionFills({
-          symbol: 'BTC/KRW',
-          limit: 20,
-        }),
         fetchExecutionEvents({
           limit: 30,
           marketType: executionMarketType,
@@ -249,21 +242,14 @@ const App: React.FC = () => {
         errors.push(fillsResult2.reason instanceof Error ? fillsResult2.reason.message : String(fillsResult2.reason));
       }
 
-      const fillsResult3 = settled[7];
-      if (fillsResult3.status === 'fulfilled') {
-        setBithumbExecutionFills(fillsResult3.value.fills);
-      } else {
-        errors.push(fillsResult3.reason instanceof Error ? fillsResult3.reason.message : String(fillsResult3.reason));
-      }
-
-      const eventsResult = settled[8];
+      const eventsResult = settled[7];
       if (eventsResult.status === 'fulfilled') {
         setExecutionEvents(eventsResult.value.events);
       } else {
         errors.push(eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason));
       }
 
-      const engineResult = settled[9];
+      const engineResult = settled[8];
       if (engineResult.status === 'fulfilled') {
         const engineStatus = engineResult.value;
         setExecutionEngineStatus(engineStatus);
@@ -637,11 +623,13 @@ const App: React.FC = () => {
     `${executionPortfolioBalanceAsset} ${formatNullableNumber(executionWalletFree, 8)}`;
   const bithumbKrwTotal = bithumbPortfolioSummary?.walletAssetTotal ?? null;
   const bithumbKrwFree = bithumbPortfolioSummary?.walletAssetFree ?? null;
-  const combinedExecutionFills = useMemo(() => {
-    const binance = executionFills.map((fill) => ({ ...fill, exchange: 'binance' as const }));
-    const bithumb = bithumbExecutionFills.map((fill) => ({ ...fill, exchange: 'bithumb' as const }));
-    return [...binance, ...bithumb].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-  }, [executionFills, bithumbExecutionFills]);
+  const combinedExecutionFills = useMemo(
+    () =>
+      executionFills
+        .map((fill) => ({ ...fill, exchange: 'binance' as const }))
+        .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0)),
+    [executionFills]
+  );
   const sidebarSections: Array<{ key: SidebarSection; label: string; description: string }> = [
     { key: 'automation', label: '자동매매', description: '실행 설정/리스크' },
     { key: 'portfolio', label: '포트폴리오', description: '잔고/체결/이벤트' },
