@@ -1978,6 +1978,22 @@ export const clearExecutionCredentials = async (
     );
 };
 
+export const updateExecutionOrderPolicy = async (request: {
+    allowLiveOrders?: boolean;
+    allowTestnetOrders?: boolean;
+}): Promise<ExecutionSafetyResponse> => {
+    return await fetchApi(
+        '/api/execution/order-policy',
+        'Execution order policy API',
+        normalizeExecutionSafetyResponse,
+        {
+            method: 'POST',
+            body: request,
+            allowFallback: false,
+        }
+    );
+};
+
 export const resetExecutionSafety = async (
     reason = 'ui-reset'
 ): Promise<ExecutionSafetyResponse> => {

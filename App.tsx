@@ -34,6 +34,7 @@ import {
   startExecutionEngine,
   stopExecutionEngine,
   updateExecutionCredentials,
+  updateExecutionOrderPolicy,
   fetchDiscordConfig,
   updateDiscordConfig,
   sendDiscordTest,
@@ -90,6 +91,7 @@ const App: React.FC = () => {
   const [isExecutionRefreshing, setIsExecutionRefreshing] = useState<boolean>(false);
   const [isEngineSubmitting, setIsEngineSubmitting] = useState<boolean>(false);
   const [isCredentialSubmitting, setIsCredentialSubmitting] = useState<boolean>(false);
+  const [isOrderPolicySubmitting, setIsOrderPolicySubmitting] = useState<boolean>(false);
   const [isReadinessChecking, setIsReadinessChecking] = useState<boolean>(false);
   const [activeSection, setActiveSection] = useState<SidebarSection>('automation');
   // Discord state
@@ -580,6 +582,28 @@ const App: React.FC = () => {
     }
   }, [refreshExecutionData]);
 
+  const handleToggleLiveOrders = useCallback(async (nextValue: boolean) => {
+    if (isOrderPolicySubmitting) return;
+    if (nextValue) {
+      if (!window.confirm('실주문을 허용할까요? 드라이런 해제 시 실제 주문이 나갑니다.')) {
+        return;
+      }
+    }
+
+    setIsOrderPolicySubmitting(true);
+    try {
+      const response = await updateExecutionOrderPolicy({ allowLiveOrders: nextValue });
+      setExecutionSafety(response);
+      setExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExecutionError(message);
+    } finally {
+      setIsOrderPolicySubmitting(false);
+    }
+  }, [isOrderPolicySubmitting, refreshExecutionData]);
+
   const handleCheckExecutionReadiness = useCallback(async () => {
     if (isReadinessChecking) return;
     setIsReadinessChecking(true);
@@ -663,6 +687,7 @@ const App: React.FC = () => {
   const bithumbCredentialPersisted = executionCredentialsStatus?.credentials.bithumb?.persisted ?? false;
 
   const executionSafeMode = executionSafety?.safety?.safeMode ?? false;
+  const executionLiveOrdersAllowed = executionSafety?.safety?.orderExecution?.allowLiveOrders ?? false;
   const isPlaying = executionEngineStatus?.engine.running ?? false;
   const enginePositionState = executionEngineStatus?.engine.positionState ?? 'IDLE';
   const engineLastPremium = executionEngineStatus?.engine.lastPremium ?? null;
@@ -1368,6 +1393,17 @@ const App: React.FC = () => {
                             className="accent-cyan-500 w-4 h-4 rounded border-slate-700 bg-slate-800"
                           />
                           드라이런 모드(실주문 없음)
+                        </label>
+
+                        <label className="text-slate-400 flex items-center gap-2 p-1">
+                          <input
+                            type="checkbox"
+                            checked={executionLiveOrdersAllowed}
+                            onChange={(e) => void handleToggleLiveOrders(e.target.checked)}
+                            disabled={isOrderPolicySubmitting}
+                            className="accent-rose-500 w-4 h-4 rounded border-slate-700 bg-slate-800"
+                          />
+                          실주문 허용
                         </label>
 
                         <button

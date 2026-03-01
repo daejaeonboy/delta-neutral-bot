@@ -245,6 +245,7 @@ const runtimeLogFile = path.join(runtimeLogDir, 'data-load-events.ndjson');
 const runtimeStateDir = path.resolve(process.cwd(), '.runtime');
 const executionEngineStateFile = path.join(runtimeStateDir, 'execution-engine-state.json');
 const executionCredentialsStateFile = path.join(runtimeStateDir, 'execution-credentials.json');
+const executionOrderPolicyStateFile = path.join(runtimeStateDir, 'execution-order-policy.json');
 const discordConfigStateFile = path.join(runtimeStateDir, 'discord-config.json');
 const frontendDistDir = path.resolve(process.cwd(), 'dist');
 const frontendIndexFile = path.join(frontendDistDir, 'index.html');
@@ -259,6 +260,9 @@ let runtimeBinanceExecutionApiKey = '';
 let runtimeBinanceExecutionApiSecret = '';
 let runtimeBinanceExecutionCredentialsUpdatedAt = null;
 let runtimeBinanceExecutionCredentialsPersisted = false;
+let runtimeExecutionAllowLiveOrders = null;
+let runtimeExecutionAllowTestnetOrders = null;
+let runtimeExecutionOrderPolicyUpdatedAt = null;
 
 let bithumbClient = null; // To be initialized later
 let bithumbClientCacheKey = null;
@@ -1342,6 +1346,8 @@ function resetExecutionSafetyState(reason = 'manual-reset') {
 }
 
 function getExecutionSafetySummary() {
+    const allowLiveOrders = getExecutionAllowLiveOrders();
+    const allowTestnetOrders = getExecutionAllowTestnetOrders();
     return {
         safeMode: executionFailureState.safeMode,
         consecutiveFailures: executionFailureState.consecutiveFailures,
@@ -1355,8 +1361,8 @@ function getExecutionSafetySummary() {
         alertTimeoutMs: executionAlertTimeoutMs,
         lastAlertSentAt: lastExecutionAlertSentAt > 0 ? lastExecutionAlertSentAt : null,
         orderExecution: {
-            allowLiveOrders: executionAllowLiveOrders,
-            allowTestnetOrders: executionAllowTestnetOrders,
+            allowLiveOrders,
+            allowTestnetOrders,
             defaultRetryCount: executionOrderRetryCount,
             defaultRetryDelayMs: executionOrderRetryDelayMs,
             idempotencyTtlMs: executionIdempotencyTtlMs,
@@ -1503,6 +1509,91 @@ function persistRuntimeExecutionCredentials(reason = 'update') {
         runtimeBinanceExecutionCredentialsPersisted = false;
         runtimeBithumbCredentialsPersisted = false;
         console.error(`Failed to persist execution credentials: ${toErrorMessage(error)}`);
+    }
+}
+
+function getExecutionAllowLiveOrders() {
+    return runtimeExecutionAllowLiveOrders ?? executionAllowLiveOrders;
+}
+
+function getExecutionAllowTestnetOrders() {
+    return runtimeExecutionAllowTestnetOrders ?? executionAllowTestnetOrders;
+}
+
+function persistExecutionOrderPolicy(reason = 'update') {
+    if (runtimeExecutionAllowLiveOrders === null && runtimeExecutionAllowTestnetOrders === null) {
+        try {
+            if (fs.existsSync(executionOrderPolicyStateFile)) {
+                fs.unlinkSync(executionOrderPolicyStateFile);
+            }
+        } catch (error) {
+            console.error(`Failed to remove execution order policy state: ${toErrorMessage(error)}`);
+        }
+        return;
+    }
+
+    try {
+        const payload = {
+            updatedAt: runtimeExecutionOrderPolicyUpdatedAt || Date.now(),
+            reason,
+            policy: {
+                allowLiveOrders: runtimeExecutionAllowLiveOrders,
+                allowTestnetOrders: runtimeExecutionAllowTestnetOrders,
+            },
+        };
+        fs.writeFileSync(executionOrderPolicyStateFile, `${JSON.stringify(payload, null, 2)}\n`, {
+            encoding: 'utf8',
+            mode: 0o600,
+        });
+    } catch (error) {
+        console.error(`Failed to persist execution order policy: ${toErrorMessage(error)}`);
+    }
+}
+
+function setRuntimeExecutionOrderPolicy({ allowLiveOrders, allowTestnetOrders, persist = true, reason = 'manual-set' }) {
+    let updated = false;
+
+    if (typeof allowLiveOrders === 'boolean') {
+        runtimeExecutionAllowLiveOrders = allowLiveOrders;
+        updated = true;
+    }
+
+    if (typeof allowTestnetOrders === 'boolean') {
+        runtimeExecutionAllowTestnetOrders = allowTestnetOrders;
+        updated = true;
+    }
+
+    if (updated) {
+        runtimeExecutionOrderPolicyUpdatedAt = Date.now();
+        if (persist) {
+            persistExecutionOrderPolicy(reason);
+        }
+    }
+
+    return updated;
+}
+
+function restoreExecutionOrderPolicyFromDisk() {
+    try {
+        if (!fs.existsSync(executionOrderPolicyStateFile)) return;
+        const raw = fs.readFileSync(executionOrderPolicyStateFile, { encoding: 'utf8' }).trim();
+        if (!raw) return;
+
+        const payload = JSON.parse(raw);
+        const policy = payload?.policy && typeof payload.policy === 'object' ? payload.policy : null;
+        if (!policy) return;
+
+        if (typeof policy.allowLiveOrders === 'boolean') {
+            runtimeExecutionAllowLiveOrders = policy.allowLiveOrders;
+        }
+        if (typeof policy.allowTestnetOrders === 'boolean') {
+            runtimeExecutionAllowTestnetOrders = policy.allowTestnetOrders;
+        }
+        runtimeExecutionOrderPolicyUpdatedAt = Number.isFinite(toFiniteNumber(payload?.updatedAt))
+            ? Number(payload.updatedAt)
+            : Date.now();
+    } catch (error) {
+        console.error(`Failed to restore execution order policy: ${toErrorMessage(error)}`);
     }
 }
 
@@ -2822,11 +2913,11 @@ async function startExecutionEngine({
             throw new Error('BINANCE_API_KEY/BINANCE_API_SECRET is not configured');
         }
 
-        if (binanceExecutionTestnet && !executionAllowTestnetOrders) {
+        if (binanceExecutionTestnet && !getExecutionAllowTestnetOrders()) {
             throw new Error('EXECUTION_ALLOW_TESTNET_ORDERS is disabled');
         }
 
-        if (!binanceExecutionTestnet && !executionAllowLiveOrders) {
+        if (!binanceExecutionTestnet && !getExecutionAllowLiveOrders()) {
             throw new Error('EXECUTION_ALLOW_LIVE_ORDERS is disabled');
         }
 
@@ -4534,6 +4625,7 @@ function runPremiumBacktest({
 }
 
 restoreRuntimeExecutionCredentialsFromDisk();
+restoreExecutionOrderPolicyFromDisk();
 restoreExecutionEngineStateFromDisk();
 loadPremiumHistoryFromDisk();
 
@@ -5561,6 +5653,65 @@ app.post('/api/execution/credentials/clear', (req, res) => {
     });
 });
 
+app.get('/api/execution/order-policy', (req, res) => {
+    res.json({
+        timestamp: Date.now(),
+        policy: {
+            allowLiveOrders: getExecutionAllowLiveOrders(),
+            allowTestnetOrders: getExecutionAllowTestnetOrders(),
+            updatedAt: runtimeExecutionOrderPolicyUpdatedAt,
+            source: {
+                allowLiveOrders: runtimeExecutionAllowLiveOrders === null ? 'env' : 'runtime',
+                allowTestnetOrders: runtimeExecutionAllowTestnetOrders === null ? 'env' : 'runtime',
+            },
+        },
+        safety: getExecutionSafetySummary(),
+    });
+});
+
+app.post('/api/execution/order-policy', (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const hasLive = Object.prototype.hasOwnProperty.call(body, 'allowLiveOrders');
+    const hasTestnet = Object.prototype.hasOwnProperty.call(body, 'allowTestnetOrders');
+    const allowLiveOrders = hasLive ? parseBoolean(body.allowLiveOrders, null) : null;
+    const allowTestnetOrders = hasTestnet ? parseBoolean(body.allowTestnetOrders, null) : null;
+
+    if (allowLiveOrders === null && allowTestnetOrders === null) {
+        res.status(400).json({
+            error: 'allowLiveOrders or allowTestnetOrders is required',
+            timestamp: Date.now(),
+            policy: {
+                allowLiveOrders: getExecutionAllowLiveOrders(),
+                allowTestnetOrders: getExecutionAllowTestnetOrders(),
+                updatedAt: runtimeExecutionOrderPolicyUpdatedAt,
+            },
+            safety: getExecutionSafetySummary(),
+        });
+        return;
+    }
+
+    setRuntimeExecutionOrderPolicy({
+        allowLiveOrders,
+        allowTestnetOrders,
+        persist: true,
+        reason: 'api-set',
+    });
+
+    res.json({
+        timestamp: Date.now(),
+        policy: {
+            allowLiveOrders: getExecutionAllowLiveOrders(),
+            allowTestnetOrders: getExecutionAllowTestnetOrders(),
+            updatedAt: runtimeExecutionOrderPolicyUpdatedAt,
+            source: {
+                allowLiveOrders: runtimeExecutionAllowLiveOrders === null ? 'env' : 'runtime',
+                allowTestnetOrders: runtimeExecutionAllowTestnetOrders === null ? 'env' : 'runtime',
+            },
+        },
+        safety: getExecutionSafetySummary(),
+    });
+});
+
 // --- Discord Config API ---
 
 // Restore discord config from .runtime on startup
@@ -6008,18 +6159,18 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
         if (binanceExecutionTestnet) {
             checks.push({
                 key: 'testnet_orders_allowed',
-                ok: executionAllowTestnetOrders,
+                ok: getExecutionAllowTestnetOrders(),
                 severity: 'error',
-                message: executionAllowTestnetOrders
+                message: getExecutionAllowTestnetOrders()
                     ? 'testnet live execution is allowed'
                     : 'EXECUTION_ALLOW_TESTNET_ORDERS is disabled',
             });
         } else {
             checks.push({
                 key: 'live_orders_allowed',
-                ok: executionAllowLiveOrders,
+                ok: getExecutionAllowLiveOrders(),
                 severity: 'error',
-                message: executionAllowLiveOrders
+                message: getExecutionAllowLiveOrders()
                     ? 'mainnet live execution is allowed'
                     : 'EXECUTION_ALLOW_LIVE_ORDERS is disabled',
             });
@@ -6619,7 +6770,7 @@ app.post('/api/execution/engine/start', async (req, res) => {
             return;
         }
 
-        if (binanceExecutionTestnet && !executionAllowTestnetOrders) {
+        if (binanceExecutionTestnet && !getExecutionAllowTestnetOrders()) {
             res.status(423).json({
                 error: 'EXECUTION_ALLOW_TESTNET_ORDERS is disabled',
                 timestamp: Date.now(),
@@ -6629,7 +6780,7 @@ app.post('/api/execution/engine/start', async (req, res) => {
             return;
         }
 
-        if (!binanceExecutionTestnet && !executionAllowLiveOrders) {
+        if (!binanceExecutionTestnet && !getExecutionAllowLiveOrders()) {
             res.status(423).json({
                 error: 'EXECUTION_ALLOW_LIVE_ORDERS is disabled',
                 timestamp: Date.now(),
@@ -6796,7 +6947,7 @@ app.post('/api/execution/binance/order', async (req, res) => {
         return;
     }
 
-    if (!dryRun && binanceExecutionTestnet && !executionAllowTestnetOrders) {
+    if (!dryRun && binanceExecutionTestnet && !getExecutionAllowTestnetOrders()) {
         recordRuntimeEvent('warn', 'api_execution_binance_order_blocked_testnet_disabled', {
             durationMs: Date.now() - startedAt,
             marketType,
@@ -6813,7 +6964,7 @@ app.post('/api/execution/binance/order', async (req, res) => {
         return;
     }
 
-    if (!dryRun && !binanceExecutionTestnet && !executionAllowLiveOrders) {
+    if (!dryRun && !binanceExecutionTestnet && !getExecutionAllowLiveOrders()) {
         recordRuntimeEvent('warn', 'api_execution_binance_order_blocked_live_disabled', {
             durationMs: Date.now() - startedAt,
             marketType,
@@ -7575,8 +7726,8 @@ app.get('/api/health', (req, res) => {
             binanceCredentialStatus: getExecutionCredentialsStatusSummary(),
             binanceMarketType: binanceExecutionMarketType,
             binanceTestnet: binanceExecutionTestnet,
-            liveOrderEnabled: executionAllowLiveOrders,
-            testnetOrderEnabled: executionAllowTestnetOrders,
+            liveOrderEnabled: getExecutionAllowLiveOrders(),
+            testnetOrderEnabled: getExecutionAllowTestnetOrders(),
             safety: getExecutionSafetySummary(),
             engineAutoStart: executionEngineAutoStart,
             engine: getExecutionEngineSnapshot(),
