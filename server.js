@@ -55,8 +55,7 @@ const envBithumbApiKey = (process.env.BITHUMB_API_KEY ?? '').trim();
 const envBithumbApiSecret = (process.env.BITHUMB_API_SECRET ?? '').trim();
 const rawBinanceExecutionMarketType = (process.env.BINANCE_EXECUTION_MARKET ?? 'coinm').trim().toLowerCase();
 const binanceExecutionMarketType = rawBinanceExecutionMarketType === 'usdm' ? 'usdm' : 'coinm';
-const rawBinanceExecutionTestnet = (process.env.BINANCE_TESTNET ?? 'true').trim().toLowerCase();
-const binanceExecutionTestnet = !['0', 'false', 'no', 'off'].includes(rawBinanceExecutionTestnet);
+const binanceExecutionTestnet = false;
 const parsedBinanceRecvWindow = Number(process.env.BINANCE_RECV_WINDOW_MS);
 const binanceRecvWindowMs =
     Number.isFinite(parsedBinanceRecvWindow) && parsedBinanceRecvWindow >= 1000
