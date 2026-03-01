@@ -1,9 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Activity, Play, Pause, Zap, DollarSign, RefreshCw, TrendingUp, Plus, X, Save } from 'lucide-react';
 import { MetricCard } from './components/MetricCard';
-import { MultiCoinPremiumHeader, MultiCoinPremiumTable } from './components/MultiCoinPremiumTable';
-import { BacktestPanel } from './components/BacktestPanel';
-import { PremiumChart } from './components/PremiumChart';
 import {
   BithumbExecutionPortfolioResponse,
   BithumbExecutionFill,
@@ -50,7 +47,7 @@ import {
 const POLLING_INTERVAL_MS = 3000;
 const EXECUTION_REFRESH_INTERVAL_MS = 15000;
 
-type SidebarSection = 'automation' | 'portfolio' | 'backtest' | 'settings';
+type SidebarSection = 'automation' | 'portfolio' | 'settings';
 
 const App: React.FC = () => {
   // --- State ---
@@ -648,12 +645,10 @@ const App: React.FC = () => {
   const sidebarSections: Array<{ key: SidebarSection; label: string; description: string }> = [
     { key: 'automation', label: '자동매매', description: '실행 설정/리스크' },
     { key: 'portfolio', label: '포트폴리오', description: '잔고/체결/이벤트' },
-    { key: 'backtest', label: '백테스트', description: '전략 검증 결과' },
     { key: 'settings', label: '설정', description: 'API/디스코드 설정' },
   ];
   const isAutomationTab = activeSection === 'automation';
   const isPortfolioTab = activeSection === 'portfolio';
-  const isBacktestTab = activeSection === 'backtest';
   const isSettingsTab = activeSection === 'settings';
 
   if (isInitialLoading && !currentData) {
@@ -815,25 +810,6 @@ const App: React.FC = () => {
                     <span>해외 환산가: ₩{normalizedGlobalKrwPrice.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
                     <span className="text-emerald-400/80 font-medium">USD/KRW 환율: {currentData.exchangeRate.toFixed(2)} · USDT/KRW (테더): {currentData.usdtKrwRate?.toFixed(2) ?? '-'}</span>
                     <span>갱신: {lastSuccessfulFetchAt ? new Date(lastSuccessfulFetchAt).toLocaleTimeString('ko-KR') : '-'}</span>
-                  </div>
-                )}
-
-                {isAutomationTab && (
-                  <div className="min-h-[500px] flex flex-col">
-                    <PremiumChart
-                      entryThreshold={config.entryThreshold}
-                      exitThreshold={config.exitThreshold}
-                    />
-                  </div>
-                )}
-
-                {isBacktestTab && (
-                  <div id="backtest-section" className="space-y-2">
-                    <BacktestPanel
-                      defaultEntryThreshold={config.entryThreshold}
-                      defaultExitThreshold={config.exitThreshold}
-                      defaultInvestmentKrw={config.investmentKrw}
-                    />
                   </div>
                 )}
 

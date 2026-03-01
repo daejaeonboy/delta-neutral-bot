@@ -2063,18 +2063,20 @@ function stopExecutionEngine(reason = 'manual-stop') {
 }
 
 async function fetchExecutionEngineMarketSnapshot() {
-    const [upbit, globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
-        fetchUpbitBtcAndUsdtKrw(),
+    const [globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
         fetchGlobalBtcUsdt(),
         getUsdKrwRate(),
-        fetchBithumbBtcKrw().catch(() => null),
+        fetchBithumbBtcKrw(),
         fetchBithumbUsdtKrw().catch(() => null),
     ]);
 
-    const krwPrice = bithumbPrice ?? upbit.btcKrw;
+    const krwPrice = bithumbPrice;
     const usdPrice = globalTicker.price;
     const exchangeRate = fxRate.usdKrw;
-    const usdtKrwRate = bithumbUsdt ?? upbit.usdtKrw;
+    const usdtKrwRate =
+        Number.isFinite(toFiniteNumber(bithumbUsdt)) && Number(bithumbUsdt) > 0
+            ? Number(bithumbUsdt)
+            : exchangeRate;
     const normalizedGlobalKrwPrice = usdPrice * exchangeRate;
     const kimchiPremiumPercent = ((krwPrice / normalizedGlobalKrwPrice) - 1) * 100;
     const usdtConversionRate = usdtKrwRate > 0 ? usdtKrwRate : exchangeRate;
@@ -4055,15 +4057,6 @@ async function fetchUsdtKrwRate() {
         console.warn(`USDT/KRW provider failed (bithumb): ${error.message}`);
     }
 
-    try {
-        const upbit = await fetchUpbitBtcAndUsdtKrw();
-        if (Number.isFinite(upbit.usdtKrw) && upbit.usdtKrw > 0) {
-            return upbit.usdtKrw;
-        }
-    } catch (error) {
-        console.warn(`USDT/KRW provider failed (upbit): ${error.message}`);
-    }
-
     const fxRate = await getUsdKrwRate();
     return fxRate.usdKrw;
 }
@@ -4578,22 +4571,26 @@ loadPremiumHistoryFromDisk();
 app.get('/api/ticker', async (req, res) => {
     const startedAt = Date.now();
     try {
-        const [upbit, globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
-            fetchUpbitBtcAndUsdtKrw(),
+        const [globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
             fetchGlobalBtcUsdt(),
             getUsdKrwRate(),
-            fetchBithumbBtcKrw().catch(() => null),
+            fetchBithumbBtcKrw(),
             fetchBithumbUsdtKrw().catch(() => null),
         ]);
 
-        // Primary domestic price: Bithumb (fallback to Upbit)
-        const krwPrice = bithumbPrice ?? upbit.btcKrw;
-        const domesticSource = bithumbPrice ? 'bithumb:BTC_KRW' : 'upbit:KRW-BTC';
+        // Primary domestic price: Bithumb only
+        const krwPrice = bithumbPrice;
+        const domesticSource = 'bithumb:BTC_KRW';
 
         const usdPrice = globalTicker.price;
         const exchangeRate = fxRate.usdKrw;
-        const usdtKrwRate = bithumbUsdt ?? upbit.usdtKrw;
-        const conversionSource = bithumbUsdt ? 'bithumb:USDT_KRW' : 'upbit:KRW-USDT';
+        const usdtKrwRate =
+            Number.isFinite(toFiniteNumber(bithumbUsdt)) && Number(bithumbUsdt) > 0
+                ? Number(bithumbUsdt)
+                : exchangeRate;
+        const conversionSource = Number.isFinite(toFiniteNumber(bithumbUsdt))
+            ? 'bithumb:USDT_KRW'
+            : fxRate.source;
 
         // Primary kimchi premium: USD/KRW (real market premium, matches Korean crypto sites)
         const normalizedGlobalKrwPrice = usdPrice * exchangeRate;
@@ -4646,6 +4643,15 @@ app.get('/api/ticker', async (req, res) => {
 
 app.get('/api/premium-candles', async (req, res) => {
     const startedAt = Date.now();
+    res.status(410).json({
+        error: 'Upbit 기반 프리미엄 캔들 기능이 비활성화되었습니다.',
+        code: 'upbit_disabled',
+        timestamp: Date.now(),
+    });
+    recordRuntimeEvent('warn', 'api_premium_candles_disabled', {
+        durationMs: Date.now() - startedAt,
+    });
+    return;
     try {
         const interval = normalizeInterval(req.query.interval);
         const config = CANDLE_INTERVAL_CONFIG[interval];
@@ -4736,6 +4742,15 @@ app.get('/api/premium-candles', async (req, res) => {
 
 app.get('/api/backtest/premium', async (req, res) => {
     const startedAt = Date.now();
+    res.status(410).json({
+        error: 'Upbit 기반 프리미엄 백테스트 기능이 비활성화되었습니다.',
+        code: 'upbit_disabled',
+        timestamp: Date.now(),
+    });
+    recordRuntimeEvent('warn', 'api_backtest_premium_disabled', {
+        durationMs: Date.now() - startedAt,
+    });
+    return;
     try {
         const interval = normalizeInterval(req.query.interval);
         const config = CANDLE_INTERVAL_CONFIG[interval];
@@ -5187,6 +5202,15 @@ const MULTI_PREMIUM_COINS = [
 
 app.get('/api/multi-premium', async (req, res) => {
     const startedAt = Date.now();
+    res.status(410).json({
+        error: 'Upbit 기반 멀티 프리미엄 기능이 비활성화되었습니다.',
+        code: 'upbit_disabled',
+        timestamp: Date.now(),
+    });
+    recordRuntimeEvent('warn', 'api_multi_premium_disabled', {
+        durationMs: Date.now() - startedAt,
+    });
+    return;
     try {
         const limit = parseLimit(req.query.limit, 20, 30);
 
@@ -6928,6 +6952,15 @@ app.post('/api/execution/binance/order', async (req, res) => {
 
 app.get('/api/backtest/premium/history', async (req, res) => {
     const startedAt = Date.now();
+    res.status(410).json({
+        error: 'Upbit 기반 백테스트 히스토리 기능이 비활성화되었습니다.',
+        code: 'upbit_disabled',
+        timestamp: Date.now(),
+    });
+    recordRuntimeEvent('warn', 'api_backtest_history_disabled', {
+        durationMs: Date.now() - startedAt,
+    });
+    return;
     try {
         const refresh = parseBoolean(req.query.refresh, false);
         const rawInterval = typeof req.query.interval === 'string' ? req.query.interval : null;
