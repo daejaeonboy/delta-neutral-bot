@@ -126,6 +126,38 @@ const App: React.FC = () => {
     return body;
   }
 
+  function translateExecutionError(message: string | null | undefined): string | null {
+    if (!message) return null;
+    const text = String(message);
+    const lower = text.toLowerCase();
+
+    if (lower.includes('access ip')) {
+      return `접근 IP가 허용되지 않았습니다. 거래소 API 설정에서 현재 공인 IP를 허용 목록에 추가하세요.\n원문: ${text}`;
+    }
+    if (
+      lower.includes('invalid api-key') ||
+      lower.includes('invalid api key') ||
+      lower.includes('permissions for action') ||
+      lower.includes('code\":-2015')
+    ) {
+      return `API 키/권한/IP 문제가 있습니다. 키 상태, 선물 권한, 허용 IP를 확인하세요.\n원문: ${text}`;
+    }
+    if (lower.includes('fetchmytrades') && lower.includes('not supported')) {
+      return `빗썸 체결 조회는 현재 지원되지 않습니다.\n원문: ${text}`;
+    }
+    if (lower.includes('failed to fetch') || lower.includes('network')) {
+      return `백엔드 연결 실패입니다. 서버 실행 여부와 프록시 주소를 확인하세요.\n원문: ${text}`;
+    }
+    if (lower.includes('execution safe mode')) {
+      return `안전모드가 활성화되어 주문이 차단된 상태입니다.\n원문: ${text}`;
+    }
+    if (lower.includes('cannot get') || lower.includes('not found')) {
+      return `요청한 API 경로가 없습니다. 프론트/백엔드 버전이 맞는지 확인하세요.\n원문: ${text}`;
+    }
+
+    return text;
+  }
+
   const appendMarketDataPoint = useCallback((newDataPoint: MarketData) => {
     setCurrentData(newDataPoint);
   }, []);
@@ -875,14 +907,14 @@ const App: React.FC = () => {
                             런타임 키 삭제
                           </button>
                         </div>
-                        {executionError && (
+                        {translateExecutionError(executionError) && (
                           <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
-                            {executionError}
+                            {translateExecutionError(executionError)}
                           </div>
                         )}
-                        {executionStatus?.error && (
+                        {translateExecutionError(executionStatus?.error) && (
                           <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
-                            바이낸스 오류: {executionStatus.error}
+                            바이낸스 오류: {translateExecutionError(executionStatus?.error)}
                           </div>
                         )}
                       </div>
@@ -942,9 +974,9 @@ const App: React.FC = () => {
                             {isCredentialSubmitting ? '저장 중...' : '키 저장/적용'}
                           </button>
                         </div>
-                        {bithumbExecutionError && (
+                        {translateExecutionError(bithumbExecutionError) && (
                           <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
-                            빗썸 오류: {bithumbExecutionError}
+                            빗썸 오류: {translateExecutionError(bithumbExecutionError)}
                           </div>
                         )}
                       </div>
@@ -1445,9 +1477,9 @@ const App: React.FC = () => {
                           <div className="text-slate-200 font-mono">₩{formatNullableNumber(bithumbKrwFree, 0)}</div>
                         </div>
                       </div>
-                      {bithumbPortfolioError && (
+                      {translateExecutionError(bithumbPortfolioError) && (
                         <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2">
-                          빗썸 잔고 조회 오류: {bithumbPortfolioError}
+                          빗썸 잔고 조회 오류: {translateExecutionError(bithumbPortfolioError)}
                         </div>
                       )}
                       <div className="overflow-x-auto">
