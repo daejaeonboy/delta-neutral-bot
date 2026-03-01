@@ -40,6 +40,7 @@ import {
   DiscordConfigResponse,
   DiscordNotificationSettings,
   PremiumAlertThreshold,
+  getApiBaseCandidates,
 } from './services/marketService';
 
 const POLLING_INTERVAL_MS = 3000;
@@ -578,6 +579,14 @@ const App: React.FC = () => {
     [currentData]
   );
 
+  const apiBaseCandidates = useMemo(() => getApiBaseCandidates(), []);
+  const primaryApiBase = apiBaseCandidates[0] ?? '';
+  const apiBaseLabel = primaryApiBase || '미설정';
+  const apiBaseIsLocal =
+    primaryApiBase.includes('localhost') ||
+    primaryApiBase.includes('127.0.0.1') ||
+    primaryApiBase.includes('::1');
+
   const effectiveConversionRate = currentData
     ? currentData.conversionRate ?? currentData.exchangeRate ?? DEFAULT_EXCHANGE_RATE
     : DEFAULT_EXCHANGE_RATE;
@@ -835,6 +844,25 @@ const App: React.FC = () => {
 
                 {isSettingsTab && (
                   <div id="settings-section" className="space-y-6">
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">운영 연결 정보</h3>
+                      <div className="text-xs text-slate-400">
+                        API Base: <span className="font-mono text-slate-200">{apiBaseLabel}</span>
+                      </div>
+                      {apiBaseCandidates.length > 1 && (
+                        <div className="text-[11px] text-slate-500 mt-1">
+                          후보: {apiBaseCandidates.slice(1).join(' · ')}
+                        </div>
+                      )}
+                      <div className="text-[10px] text-slate-600 mt-2">
+                        VITE_API_BASE_URL을 설정하면 브라우저 위치와 무관하게 해당 주소로 고정됩니다.
+                      </div>
+                      {apiBaseIsLocal && (
+                        <div className="text-[10px] text-amber-400/80 mt-1">
+                          현재 로컬 API를 사용 중입니다. 운영 서버 사용 시 VITE_API_BASE_URL을 AWS 주소로 지정하세요.
+                        </div>
+                      )}
+                    </div>
                     {/* Binance API Key Management */}
                     <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
                       <h3 className="text-lg font-semibold text-slate-200 mb-4">바이난스 API 키 관리</h3>
@@ -855,6 +883,10 @@ const App: React.FC = () => {
                             {executionCredentialHint ? ` · ${executionCredentialHint}` : ''}
                             {executionCredentialUpdatedAt ? ` · ${new Date(executionCredentialUpdatedAt).toLocaleTimeString('ko-KR')}` : ''}
                             {executionCredentialPersisted ? ' · persisted' : ''}
+                          </div>
+                          <div className="text-[10px] text-slate-600">
+                            런타임 키(source=runtime)는 .env 키보다 우선 적용됩니다.
+                            {' '}현재 선택 시장({executionMarketType.toUpperCase()}) 권한이 바이낸스 API에 있어야 합니다.
                           </div>
                         </div>
                         <div className="grid grid-cols-1 gap-2">
@@ -936,6 +968,9 @@ const App: React.FC = () => {
                             {bithumbCredentialHint ? ` · ${bithumbCredentialHint}` : ''}
                             {bithumbCredentialUpdatedAt ? ` · ${new Date(bithumbCredentialUpdatedAt).toLocaleTimeString('ko-KR')}` : ''}
                             {bithumbCredentialPersisted ? ' · persisted' : ''}
+                          </div>
+                          <div className="text-[10px] text-slate-600">
+                            런타임 키(source=runtime)는 .env 키보다 우선 적용됩니다.
                           </div>
                         </div>
                         <div className="grid grid-cols-1 gap-2">

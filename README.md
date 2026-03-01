@@ -6,36 +6,26 @@
 
 사전 요구사항: Node.js 20+
 
-1. 의존성 설치
-   `npm install`
-2. Gemini 키 설정 (`.env.local`)
-   `GEMINI_API_KEY=...`
-3. 프론트+백엔드 동시 실행
-   `npm run dev:all`
+1. 의존성 설치: `npm install`
+2. `.env.local`에 API 주소 설정: `VITE_API_BASE_URL=http://43.201.172.91:4000` (운영) 또는 `http://localhost:4000` (로컬)
+3. 실행: `npm run dev:all` (로컬 백엔드 포함) 또는 `npm run dev` (프론트만)
 
-프론트엔드: `http://localhost:3000`  
-백엔드 API: `http://localhost:4000`
+프론트엔드: `http://localhost:3000`
+백엔드 API: `VITE_API_BASE_URL` 값에 따라 로컬 또는 원격(AWS) 사용
 
 참고: 개발 서버는 `localhost`의 IPv4/IPv6(`127.0.0.1`/`::1`) 모두에서 접속 가능하도록 설정되어 있습니다.
 
 ## 데이터 소스
 
-- 국내 시세: Upbit `KRW-BTC`
-- 해외 시세: Binance `BTCUSDT` (실패 시 Bybit `BTCUSDT` fallback)
+- 국내 시세: Bithumb `BTC_KRW`
+- 해외 시세: Binance COIN-M `BTCUSD_PERP` (실패 시 Binance Spot `BTCUSDT` → Bybit → Kraken → OKX → CoinGecko 순차 폴백)
 - 환율(USD/KRW): `open.er-api` (실패 시 `frankfurter` fallback)
-- 환산율(KRW/USDT): Upbit `KRW-USDT`
-- 김프 계산식: `((국내 BTC/KRW) / (해외 BTC/USDT * KRW/USDT) - 1) * 100`
+- 환산율(USDT/KRW): Bithumb `USDT_KRW` (없으면 USD/KRW 사용)
+- 김프 계산식: `((국내 BTC/KRW) / (해외 BTC/USD * 합성환율) - 1) * 100`
 
 ## 봉(캔들) 데이터
 
-- 지원 봉: `1분봉`, `10분봉`, `30분봉`, `1일봉`
-- API: `GET /api/premium-candles?interval=1m|10m|30m|1d&limit=...`
-- 봉 계산:
-  - 국내 BTC/KRW 캔들: Upbit
-  - 해외 BTC/USDT 캔들: Binance
-  - 환산 KRW/USDT 캔들: Upbit
-  - 각 봉의 O/H/L/C 프리미엄을 계산해 캔들화
-- 참고: Binance는 `10m` 원본 봉이 없어 `5m`를 서버에서 10분으로 집계합니다.
+현재 Upbit 기반 프리미엄 캔들 기능은 비활성화되어 `410`을 반환합니다.
 
 ## 상위 거래량 + 펀딩비
 
@@ -48,27 +38,11 @@
 
 ## 멀티 코인 김프
 
-- API: `GET /api/multi-premium?limit=20`
-- 데이터 소스: OKX Spot 우선, 실패 시 Binance Spot, Bybit Spot 순차 폴백
+현재 Upbit 기반 멀티 코인 김프 기능은 비활성화되어 `410`을 반환합니다.
 
 ## 전략 백테스트
 
-- API:
-  - 기본: `GET /api/backtest/premium?interval=30m&limit=200&premiumBasis=USD&entryThreshold=2.0&exitThreshold=0.0&leverage=1&initialCapitalKrw=10000000&feeBps=6&slippageBps=2&forceCloseAtEnd=true&useStoredData=true`
-  - 기간 지정: `GET /api/backtest/premium?interval=30m&premiumBasis=USD&entryThreshold=2.0&exitThreshold=0.0&leverage=1&initialCapitalKrw=10000000&feeBps=6&slippageBps=2&forceCloseAtEnd=true&useStoredData=true&startTime=1735689600000&endTime=1767225600000`
-- 기능:
-  - 과거 프리미엄 캔들 기반 판매/매수 시뮬레이션
-  - 저장된 히스토리(로컬 파일)에서 기간 필터 기반 실행 가능
-  - 프리미엄 기준 전환 지원: `premiumBasis=USDT|USD`
-  - `premiumBasis=USD`는 일자별 USD/KRW 히스토리(Frankfurter)로 계산하며, 누락일은 인접일/현재환율로 보간
-  - 수수료/슬리피지 반영 순손익 계산
-  - 승률/최대낙폭/거래 로그 반환
-- 파라미터 해석:
-  - `entryThreshold`: 판매 임계값(김프가 이 값 이상일 때)
-  - `exitThreshold`: 매수 임계값(김프가 이 값 이하일 때)
-- 히스토리 상태 확인: `GET /api/backtest/premium/history?interval=1m`  
-  (전체 요약: `GET /api/backtest/premium/history`)
-- 히스토리 파일: `data/premium-history/premium-candles-*.ndjson`
+현재 Upbit 기반 프리미엄 백테스트 기능은 비활성화되어 `410`을 반환합니다.
 
 ## 바이낸스 실행 연결 (실거래 준비)
 
@@ -125,8 +99,7 @@
 
 ## 환경 변수
 
-- `VITE_API_BASE_URL` (선택): 프론트엔드 API 주소 고정값 (운영에서는 반드시 설정 권장)
-  - 미설정 시 로컬 환경은 `localhost:4000` 우선, 그 외에는 `same-origin` 사용
+- `VITE_API_BASE_URL` (권장): 프론트엔드 API 주소 고정값. 설정 시 해당 주소만 사용하며, 미설정 시 현재 origin 및 로컬 `:4000` 후보를 순차 사용
 - `PORT` (선택): 백엔드 포트 (기본값 `4000`)
 - `CANDLE_CACHE_TTL_MS` (선택): 봉 API 캐시 TTL (기본값 `20000`)
 - `PREMIUM_HISTORY_MAX_POINTS` (선택): interval별 히스토리 최대 저장 봉 수 (기본값 `50000`)
@@ -135,6 +108,7 @@
 - `REQUEST_RETRY_COUNT` (선택): 외부 API 재시도 횟수 (기본값 `1`)
 - `REQUEST_RETRY_DELAY_MS` (선택): 재시도 기본 지연(ms, 기본값 `250`)
 - `BINANCE_API_KEY` / `BINANCE_API_SECRET`: 바이낸스 API 키
+- `BITHUMB_API_KEY` / `BITHUMB_API_SECRET`: 빗썸 API 키
 - `BINANCE_EXECUTION_MARKET` (선택): `coinm` 또는 `usdm` (기본값 `coinm`)
 - `BINANCE_TESTNET` (선택): `true|false` (기본값 `true`)
 - `BINANCE_RECV_WINDOW_MS` (선택): 서명 요청 recvWindow (기본값 `5000`)
@@ -179,6 +153,8 @@
 - 공용 URL에서 운영할 때는 별도 인증(예: Cloudflare Access/사설망)을 적용하세요. 실행 키/자동매매 제어 API는 민감 엔드포인트입니다.
 - UI에서는 `운영 로그인`으로 인증해야 실행 API 조회/제어가 가능합니다. (`EXECUTION_ADMIN_TOKEN`은 헤더 기반 API 호출용)
 - Railway 리전에 따라 Binance가 `451 restricted location`으로 차단될 수 있습니다. Binance 자동매매는 아시아 리전(예: `asia-southeast1`)에서 먼저 readiness 점검 후 사용하세요.
+- Binance `-2015` 오류는 IP 화이트리스트, API 권한, 선택 시장(COIN-M/USDT-M) 불일치 가능성이 있습니다.
+- 화면의 API Base가 `localhost`로 표시되면 프론트가 로컬 백엔드를 호출 중이니 `VITE_API_BASE_URL`을 확인하세요.
 - 메인넷 실주문 전환 체크리스트:
   1. `BINANCE_TESTNET=false`
   2. `BINANCE_API_KEY`, `BINANCE_API_SECRET` 설정

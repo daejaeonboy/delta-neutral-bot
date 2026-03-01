@@ -96,6 +96,14 @@ function buildApiBaseCandidates(): string[] {
 const apiBaseCandidates = buildApiBaseCandidates();
 const EXECUTION_ADMIN_TOKEN_STORAGE_KEY = 'execution_admin_token';
 
+export function getApiBaseCandidates(): string[] {
+    return [...apiBaseCandidates];
+}
+
+export function getPrimaryApiBase(): string | null {
+    return apiBaseCandidates.length > 0 ? apiBaseCandidates[0] : null;
+}
+
 function getExecutionAdminTokenFromStorage(): string | null {
     if (typeof window === 'undefined') return null;
     try {
