@@ -51,6 +51,9 @@ function buildApiBaseCandidates(): string[] {
     const candidates: string[] = [];
 
     const envBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
+    if (envBase) {
+        return [envBase];
+    }
 
     if (typeof window !== 'undefined') {
         const sameOrigin = normalizeBaseUrl(window.location.origin);
