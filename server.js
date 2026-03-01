@@ -5591,33 +5591,42 @@ function restartDiscordPeriodicReportTimer() {
 
     discordPeriodicReportTimer = setInterval(async () => {
         if (!discordWebhookUrl || !discordNotificationSettings.periodicReportEnabled) return;
-
-        try {
-            const snapshot = await fetchExecutionEngineMarketSnapshot();
-            const running = executionEngineState.running;
-            const posState = executionEngineState.positionState;
-            const marketFields = buildDiscordMarketCoreFields(snapshot, {
-                premiumLabel: '김치프리미엄(USD)',
-                premiumValue: snapshot.kimchiPremiumPercent,
-                includePremium: true,
-                includeUsdtPremium: true,
-            });
-
-            // 정기 보고는 쿨다운 무시
-            lastDiscordNotificationAt = 0;
-            void sendDiscordNotification({
-                title: '📊 김프 정기 보고',
-                description: '현재 BTC 김치프리미엄 현황',
-                color: 0x6366f1,
-                fields: [
-                    ...marketFields,
-                    { name: '엔진', value: running ? `🟢 ${posState}` : '⏹️ 정지' },
-                ],
-            });
-        } catch (err) {
-            console.error(`Discord periodic report failed: ${toErrorMessage(err)}`);
-        }
+        await sendDiscordPeriodicReportNow();
     }, intervalMs);
+}
+
+async function sendDiscordPeriodicReportNow() {
+    if (!discordWebhookUrl || !discordNotificationSettings.periodicReportEnabled) {
+        return;
+    }
+
+    try {
+        const snapshot = await fetchExecutionEngineMarketSnapshot();
+        const running = executionEngineState.running;
+        const posState = executionEngineState.positionState;
+        const marketFields = buildDiscordMarketCoreFields(snapshot, {
+            premiumLabel: '김치프리미엄(USD)',
+            premiumValue: snapshot.kimchiPremiumPercent,
+            includePremium: true,
+            includeUsdtPremium: true,
+        });
+
+        // 정기 보고는 쿨다운 무시
+        const savedCooldown = lastDiscordNotificationAt;
+        lastDiscordNotificationAt = 0;
+        await sendDiscordNotification({
+            title: '📊 김프 정기 보고',
+            description: '현재 BTC 김치프리미엄 현황',
+            color: 0x6366f1,
+            fields: [
+                ...marketFields,
+                { name: '엔진', value: running ? `🟢 ${posState}` : '⏹️ 정지' },
+            ],
+        });
+        lastDiscordNotificationAt = savedCooldown;
+    } catch (err) {
+        console.error(`Discord periodic report failed: ${toErrorMessage(err)}`);
+    }
 }
 
 function handlePremiumThresholdAlerts({ marketSnapshot, premiumValue, previousPremium }) {
@@ -5771,6 +5780,9 @@ app.post('/api/discord/config', express.json(), (req, res) => {
     // Restart periodic report timer with new settings
     restartDiscordPeriodicReportTimer();
     restartDiscordPremiumAlertTimer();
+    if (discordNotificationSettings.periodicReportEnabled && discordWebhookUrl) {
+        void sendDiscordPeriodicReportNow();
+    }
 
     res.json({
         configured: discordWebhookUrl.length > 0,
