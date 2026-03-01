@@ -1604,22 +1604,40 @@ function setRuntimeExecutionCredentials({ apiKey, apiSecret, bithumbApiKey, bith
     });
 }
 
-function clearRuntimeExecutionCredentials(reason = 'manual-clear') {
-    runtimeBinanceExecutionApiKey = '';
-    runtimeBinanceExecutionApiSecret = '';
-    runtimeBinanceExecutionCredentialsUpdatedAt = Date.now();
-    runtimeBinanceExecutionCredentialsPersisted = false;
+function clearRuntimeExecutionCredentials(options = {}) {
+    const normalizedOptions =
+        typeof options === 'string'
+            ? { reason: options }
+            : options && typeof options === 'object'
+                ? options
+                : {};
+    const clearBinance = normalizedOptions.binance !== false;
+    const clearBithumb = normalizedOptions.bithumb !== false;
+    const reason = typeof normalizedOptions.reason === 'string' ? normalizedOptions.reason : 'manual-clear';
 
-    runtimeBithumbApiKey = '';
-    runtimeBithumbApiSecret = '';
-    runtimeBithumbCredentialsUpdatedAt = Date.now();
-    runtimeBithumbCredentialsPersisted = false;
+    if (clearBinance) {
+        runtimeBinanceExecutionApiKey = '';
+        runtimeBinanceExecutionApiSecret = '';
+        runtimeBinanceExecutionCredentialsUpdatedAt = Date.now();
+        runtimeBinanceExecutionCredentialsPersisted = false;
+    }
+
+    if (clearBithumb) {
+        runtimeBithumbApiKey = '';
+        runtimeBithumbApiSecret = '';
+        runtimeBithumbCredentialsUpdatedAt = Date.now();
+        runtimeBithumbCredentialsPersisted = false;
+    }
 
     clearExecutionClientCaches();
     persistRuntimeExecutionCredentials(reason);
 
     recordRuntimeEvent('warn', 'execution_credentials_cleared', {
         source: 'runtime',
+        cleared: {
+            binance: clearBinance,
+            bithumb: clearBithumb,
+        },
     });
 }
 
@@ -5509,7 +5527,35 @@ app.post('/api/execution/credentials/clear', (req, res) => {
         return;
     }
 
-    clearRuntimeExecutionCredentials('api-clear');
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const exchange = parseOptionalString(body.exchange, 32);
+    let clearBinance = true;
+    let clearBithumb = true;
+
+    if (exchange) {
+        const normalized = exchange.trim().toLowerCase();
+        if (normalized === 'binance') {
+            clearBithumb = false;
+        } else if (normalized === 'bithumb') {
+            clearBinance = false;
+        } else if (normalized === 'all') {
+            clearBinance = true;
+            clearBithumb = true;
+        } else {
+            res.status(400).json({
+                error: 'Invalid exchange. Use binance, bithumb, or all.',
+                timestamp: Date.now(),
+                credentials: getExecutionCredentialsStatusSummary(),
+            });
+            return;
+        }
+    }
+
+    clearRuntimeExecutionCredentials({
+        binance: clearBinance,
+        bithumb: clearBithumb,
+        reason: 'api-clear',
+    });
     res.json({
         timestamp: Date.now(),
         credentials: getExecutionCredentialsStatusSummary(),

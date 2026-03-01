@@ -1963,14 +1963,16 @@ export const updateExecutionCredentials = async (request: {
     );
 };
 
-export const clearExecutionCredentials = async (): Promise<ExecutionCredentialsStatusResponse> => {
+export const clearExecutionCredentials = async (
+    exchange?: 'binance' | 'bithumb' | 'all'
+): Promise<ExecutionCredentialsStatusResponse> => {
     return await fetchApi(
         '/api/execution/credentials/clear',
         'Execution credentials clear API',
         normalizeExecutionCredentialsStatusResponse,
         {
             method: 'POST',
-            body: {},
+            body: exchange ? { exchange } : {},
             allowFallback: false,
         }
     );

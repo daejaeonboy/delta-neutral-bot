@@ -466,31 +466,23 @@ const App: React.FC = () => {
   ]);
 
 
-  const handleSaveExecutionCredentials = useCallback(async () => {
+  const handleSaveBinanceCredentials = useCallback(async () => {
     if (isCredentialSubmitting) return;
-
-    const hasBinanceInput = executionApiKeyInput.trim() && executionApiSecretInput.trim();
-    const hasBithumbInput = bithumbApiKeyInput.trim() && bithumbApiSecretInput.trim();
-
-    if (!hasBinanceInput && !hasBithumbInput) {
-      setExecutionError('바이낸스 또는 빗썸의 API 키와 시크릿을 모두 입력하세요.');
+    if (!executionApiKeyInput.trim() || !executionApiSecretInput.trim()) {
+      setExecutionError('바이낸스 API 키와 시크릿을 입력하세요.');
       return;
     }
 
     setIsCredentialSubmitting(true);
     try {
       const response = await updateExecutionCredentials({
-        apiKey: hasBinanceInput ? executionApiKeyInput.trim() : undefined,
-        apiSecret: hasBinanceInput ? executionApiSecretInput.trim() : undefined,
-        bithumbApiKey: hasBithumbInput ? bithumbApiKeyInput.trim() : undefined,
-        bithumbApiSecret: hasBithumbInput ? bithumbApiSecretInput.trim() : undefined,
+        apiKey: executionApiKeyInput.trim(),
+        apiSecret: executionApiSecretInput.trim(),
         persist: executionCredentialPersist,
       });
       setExecutionCredentialsStatus(response);
       setExecutionApiKeyInput('');
       setExecutionApiSecretInput('');
-      setBithumbApiKeyInput('');
-      setBithumbApiSecretInput('');
       setExecutionError(null);
       await refreshExecutionData(false);
     } catch (error) {
@@ -502,6 +494,37 @@ const App: React.FC = () => {
   }, [
     executionApiKeyInput,
     executionApiSecretInput,
+    executionCredentialPersist,
+    isCredentialSubmitting,
+    refreshExecutionData,
+  ]);
+
+  const handleSaveBithumbCredentials = useCallback(async () => {
+    if (isCredentialSubmitting) return;
+    if (!bithumbApiKeyInput.trim() || !bithumbApiSecretInput.trim()) {
+      setBithumbExecutionError('빗썸 API 키와 시크릿을 입력하세요.');
+      return;
+    }
+
+    setIsCredentialSubmitting(true);
+    try {
+      const response = await updateExecutionCredentials({
+        bithumbApiKey: bithumbApiKeyInput.trim(),
+        bithumbApiSecret: bithumbApiSecretInput.trim(),
+        persist: executionCredentialPersist,
+      });
+      setExecutionCredentialsStatus(response);
+      setBithumbApiKeyInput('');
+      setBithumbApiSecretInput('');
+      setBithumbExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBithumbExecutionError(message);
+    } finally {
+      setIsCredentialSubmitting(false);
+    }
+  }, [
     bithumbApiKeyInput,
     bithumbApiSecretInput,
     executionCredentialPersist,
@@ -509,19 +532,37 @@ const App: React.FC = () => {
     refreshExecutionData,
   ]);
 
-  const handleClearExecutionCredentials = useCallback(async () => {
+  const handleClearBinanceCredentials = useCallback(async () => {
     if (isCredentialSubmitting) return;
-    if (!window.confirm('런타임 API 키를 삭제할까요? (환경변수 키는 삭제되지 않습니다)')) return;
+    if (!window.confirm('바이낸스 런타임 API 키를 삭제할까요? (환경변수 키는 삭제되지 않습니다)')) return;
 
     setIsCredentialSubmitting(true);
     try {
-      const response = await clearExecutionCredentials();
+      const response = await clearExecutionCredentials('binance');
       setExecutionCredentialsStatus(response);
       setExecutionError(null);
       await refreshExecutionData(false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setExecutionError(message);
+    } finally {
+      setIsCredentialSubmitting(false);
+    }
+  }, [isCredentialSubmitting, refreshExecutionData]);
+
+  const handleClearBithumbCredentials = useCallback(async () => {
+    if (isCredentialSubmitting) return;
+    if (!window.confirm('빗썸 런타임 API 키를 삭제할까요? (환경변수 키는 삭제되지 않습니다)')) return;
+
+    setIsCredentialSubmitting(true);
+    try {
+      const response = await clearExecutionCredentials('bithumb');
+      setExecutionCredentialsStatus(response);
+      setBithumbExecutionError(null);
+      await refreshExecutionData(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBithumbExecutionError(message);
     } finally {
       setIsCredentialSubmitting(false);
     }
@@ -918,7 +959,7 @@ const App: React.FC = () => {
                         </label>
                         <div className="flex gap-2">
                           <button
-                            onClick={() => void handleSaveExecutionCredentials()}
+                            onClick={() => void handleSaveBinanceCredentials()}
                             disabled={isCredentialSubmitting}
                             className="px-3 py-1.5 rounded bg-cyan-900/30 border border-cyan-800/50 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-60 transition-colors"
                           >
@@ -932,7 +973,7 @@ const App: React.FC = () => {
                             {isExecutionRefreshing ? '확인 중...' : '연결 테스트'}
                           </button>
                           <button
-                            onClick={() => void handleClearExecutionCredentials()}
+                            onClick={() => void handleClearBinanceCredentials()}
                             disabled={isCredentialSubmitting}
                             className="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-60 transition-colors"
                           >
@@ -1002,11 +1043,18 @@ const App: React.FC = () => {
                         </label>
                         <div className="flex gap-2">
                           <button
-                            onClick={() => void handleSaveExecutionCredentials()}
+                            onClick={() => void handleSaveBithumbCredentials()}
                             disabled={isCredentialSubmitting}
                             className="px-3 py-1.5 rounded bg-cyan-900/30 border border-cyan-800/50 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-60 transition-colors"
                           >
                             {isCredentialSubmitting ? '저장 중...' : '키 저장/적용'}
+                          </button>
+                          <button
+                            onClick={() => void handleClearBithumbCredentials()}
+                            disabled={isCredentialSubmitting}
+                            className="px-3 py-1.5 rounded bg-slate-800 border border-slate-700 text-xs font-semibold text-slate-300 hover:bg-slate-700 disabled:opacity-60 transition-colors"
+                          >
+                            런타임 키 삭제
                           </button>
                         </div>
                         {translateExecutionError(bithumbExecutionError) && (
