@@ -255,6 +255,10 @@ const App: React.FC = () => {
       if (engineResult.status === 'fulfilled') {
         const engineStatus = engineResult.value;
         setExecutionEngineStatus(engineStatus);
+        const loadedOrderPct = engineStatus.engine.orderBalancePct;
+        if (Number.isFinite(loadedOrderPct) && loadedOrderPct > 0) {
+          setExecutionOrderBalancePct(loadedOrderPct);
+        }
       } else {
         errors.push(engineResult.reason instanceof Error ? engineResult.reason.message : String(engineResult.reason));
       }

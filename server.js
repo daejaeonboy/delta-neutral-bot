@@ -1099,7 +1099,9 @@ function parseExecutionPositionSide(value) {
 function parseExecutionStrategyAction(value) {
     if (value === null || value === undefined) return null;
     const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
-    if (normalized === 'ENTRY_SELL' || normalized === 'EXIT_BUY') return normalized;
+    if (normalized === 'ENTRY_SELL' || normalized === 'EXIT_BUY' || normalized === 'ENTRY_BUY' || normalized === 'EXIT_SELL') {
+        return normalized;
+    }
     return null;
 }
 
@@ -2025,13 +2027,14 @@ function stopExecutionEngine(reason = 'manual-stop') {
 }
 
 async function fetchExecutionEngineMarketSnapshot() {
-    const [upbit, globalTicker, fxRate] = await Promise.all([
+    const [upbit, globalTicker, fxRate, bithumbPrice] = await Promise.all([
         fetchUpbitBtcAndUsdtKrw(),
         fetchGlobalBtcUsdt(),
         getUsdKrwRate(),
+        fetchBithumbBtcKrw().catch(() => null),
     ]);
 
-    const krwPrice = upbit.btcKrw;
+    const krwPrice = bithumbPrice ?? upbit.btcKrw;
     const usdPrice = globalTicker.price;
     const exchangeRate = fxRate.usdKrw;
     const usdtKrwRate = upbit.usdtKrw;
@@ -2193,11 +2196,13 @@ async function syncExecutionEnginePositionState() {
     return executionEngineState.positionState;
 }
 
-async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue) {
+async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue, options = {}) {
     const url = `http://127.0.0.1:${port}/api/execution/binance/order`;
+    const allowInSafeMode = Boolean(options.allowInSafeMode);
+    const idempotencyKeyPrefix = options.idempotencyKeyPrefix ?? 'engine';
 
     const requestExecutionOrder = async (positionSide) => {
-        const idempotencyKey = `engine-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
+        const idempotencyKey = `${idempotencyKeyPrefix}-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
         const body = {
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
@@ -2217,6 +2222,10 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
                 krwPrice: marketSnapshot.krwPrice,
             },
         };
+
+        if (allowInSafeMode) {
+            body.allowInSafeMode = true;
+        }
 
         if (positionSide) {
             body.positionSide = positionSide;
@@ -2277,6 +2286,96 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
         }
         throw error;
     }
+}
+
+function deriveSpotAmountFromBinanceOrder(orderAmount, binanceClient, marketSnapshot) {
+    const amount = toFiniteNumber(orderAmount);
+    if (!Number.isFinite(amount) || amount <= 0) return NaN;
+
+    const price = toFiniteNumber(marketSnapshot?.usdPrice);
+    const market =
+        binanceClient && typeof binanceClient.market === 'function'
+            ? binanceClient.market(executionEngineState.symbol)
+            : null;
+    const contractSize = toFiniteNumber(market?.contractSize);
+
+    if (market?.inverse && Number.isFinite(contractSize) && contractSize > 0) {
+        if (!Number.isFinite(price) || price <= 0) return NaN;
+        return round((amount * contractSize) / price, 8);
+    }
+
+    return round(amount, 8);
+}
+
+async function placeExecutionEngineBithumbOrder(
+    side,
+    amount,
+    marketSnapshot,
+    premiumValue,
+    options = {}
+) {
+    const idempotencyKeyPrefix = options.idempotencyKeyPrefix ?? 'engine-bithumb';
+    const allowInSafeMode = Boolean(options.allowInSafeMode);
+    const strategyAction = options.strategyAction ?? null;
+    const idempotencyKey = `${idempotencyKeyPrefix}-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
+    const url = `http://127.0.0.1:${port}/api/execution/bithumb/order`;
+    const body = {
+        symbol: 'BTC/KRW',
+        side,
+        type: 'market',
+        amount,
+        dryRun: executionEngineState.dryRun,
+        strategyContext: {
+            action: strategyAction,
+            decisionTimestamp: marketSnapshot.timestamp,
+            premiumPct: marketSnapshot.kimchiPremiumPercent,
+            effectivePremiumPct: premiumValue,
+            usdtKrwRate: marketSnapshot.usdtKrwRate,
+            exchangeRate: marketSnapshot.exchangeRate,
+            usdPrice: marketSnapshot.usdPrice,
+            krwPrice: marketSnapshot.krwPrice,
+        },
+    };
+
+    if (allowInSafeMode) {
+        body.allowInSafeMode = true;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'Idempotency-Key': idempotencyKey,
+            ...getExecutionEngineAuthHeaders(),
+        },
+        body: JSON.stringify(body),
+    });
+
+    let text = '';
+    try {
+        text = (await response.text()).trim();
+    } catch {
+        text = '';
+    }
+    let payload = null;
+    if (text) {
+        try {
+            payload = JSON.parse(text);
+        } catch {
+            payload = null;
+        }
+    }
+
+    if (!response.ok) {
+        const message =
+            (payload && typeof payload.error === 'string' && payload.error) ||
+            text ||
+            `HTTP ${response.status}`;
+        throw new Error(message);
+    }
+
+    return payload;
 }
 
 function scheduleExecutionEngineTick(delayMs = executionEngineState.pollIntervalMs) {
@@ -2403,7 +2502,10 @@ async function runExecutionEngineTick() {
         if (!action) return;
 
         const side = action === 'ENTRY' ? 'sell' : 'buy';
+        const bithumbSide = action === 'ENTRY' ? 'buy' : 'sell';
         let orderAmount = 0;
+        let spotOrderAmount = 0;
+        let binanceClient = null;
 
         try {
             const rawPct = executionEngineState.orderBalancePct;
@@ -2443,18 +2545,18 @@ async function runExecutionEngineTick() {
             };
 
             if (!executionEngineState.dryRun) {
-                const client = await getBinanceExecutionClient(executionEngineState.marketType, true);
+                binanceClient = await getBinanceExecutionClient(executionEngineState.marketType, true);
 
                 if (action === 'ENTRY') {
-                    const balance = await client.fetchBalance();
+                    const balance = await binanceClient.fetchBalance();
                     const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
                     const freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
                     if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
                         throw new Error(`Insufficient ${balanceAsset} balance (${freeBalance})`);
                     }
-                    orderAmount = await computeEntryAmount(client, freeBalance);
+                    orderAmount = await computeEntryAmount(binanceClient, freeBalance);
                 } else {
-                    const positions = await client.fetchPositions([executionEngineState.symbol]);
+                    const positions = await binanceClient.fetchPositions([executionEngineState.symbol]);
                     const snapshot = resolveShortPositionSnapshot(positions, executionEngineState.symbol);
                     if (snapshot.hadPositions) {
                         executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
@@ -2465,16 +2567,15 @@ async function runExecutionEngineTick() {
                     orderAmount = round(snapshot.shortContracts * pctFactor, 8);
                 }
             } else {
-                let client = null;
                 let freeBalance = NaN;
                 if (hasBinanceExecutionCredentials()) {
                     try {
-                        client = await getBinanceExecutionClient(executionEngineState.marketType, true);
-                        const balance = await client.fetchBalance();
+                        binanceClient = await getBinanceExecutionClient(executionEngineState.marketType, true);
+                        const balance = await binanceClient.fetchBalance();
                         const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
                         freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
                     } catch {
-                        client = null;
+                        binanceClient = null;
                         freeBalance = NaN;
                     }
                 }
@@ -2484,14 +2585,70 @@ async function runExecutionEngineTick() {
                 }
 
                 if (action === 'ENTRY') {
-                    orderAmount = await computeEntryAmount(client, freeBalance);
+                    orderAmount = await computeEntryAmount(binanceClient, freeBalance);
                 } else if (
                     executionEngineState.lastOrderSide === 'sell' &&
                     Number.isFinite(executionEngineState.lastOrderAmount)
                 ) {
                     orderAmount = round(executionEngineState.lastOrderAmount * pctFactor, 8);
                 } else {
-                    orderAmount = await computeEntryAmount(client, freeBalance);
+                    orderAmount = await computeEntryAmount(binanceClient, freeBalance);
+                }
+            }
+
+            spotOrderAmount = deriveSpotAmountFromBinanceOrder(orderAmount, binanceClient, marketSnapshot);
+            if (!Number.isFinite(spotOrderAmount) || spotOrderAmount <= 0) {
+                throw new Error(`Calculated spot amount is invalid: ${spotOrderAmount}`);
+            }
+
+            if (!executionEngineState.dryRun) {
+                if (!hasBithumbExecutionCredentials()) {
+                    throw new Error('BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured');
+                }
+
+                const bithumbClient = await getBithumbExecutionClient(true);
+                const balance = await bithumbClient.fetchBalance();
+
+                if (action === 'ENTRY') {
+                    const freeKrw = toFiniteNumber(balance?.KRW?.free ?? balance?.krw?.free);
+                    const krwPrice = toFiniteNumber(marketSnapshot.krwPrice);
+                    if (!Number.isFinite(freeKrw) || freeKrw <= 0) {
+                        throw new Error('Insufficient KRW balance on Bithumb');
+                    }
+                    if (!Number.isFinite(krwPrice) || krwPrice <= 0) {
+                        throw new Error('KRW price is not available for spot sizing');
+                    }
+                    const maxSpotAmount = freeKrw / krwPrice;
+                    if (maxSpotAmount <= 0) {
+                        throw new Error('Bithumb KRW balance is too small');
+                    }
+                    if (maxSpotAmount < spotOrderAmount) {
+                        const ratio = maxSpotAmount / spotOrderAmount;
+                        orderAmount = round(orderAmount * ratio, 8);
+                        spotOrderAmount = round(maxSpotAmount, 8);
+                        recordRuntimeEvent('warn', 'execution_engine_spot_balance_clamped', {
+                            action,
+                            maxSpotAmount: round(maxSpotAmount, 8),
+                            orderAmount: round(orderAmount, 8),
+                            spotOrderAmount,
+                        });
+                    }
+                } else {
+                    const freeBtc = toFiniteNumber(balance?.BTC?.free ?? balance?.btc?.free);
+                    if (!Number.isFinite(freeBtc) || freeBtc <= 0) {
+                        throw new Error('Insufficient BTC balance on Bithumb');
+                    }
+                    if (freeBtc < spotOrderAmount) {
+                        const ratio = freeBtc / spotOrderAmount;
+                        orderAmount = round(orderAmount * ratio, 8);
+                        spotOrderAmount = round(freeBtc, 8);
+                        recordRuntimeEvent('warn', 'execution_engine_spot_balance_clamped', {
+                            action,
+                            maxSpotAmount: round(freeBtc, 8),
+                            orderAmount: round(orderAmount, 8),
+                            spotOrderAmount,
+                        });
+                    }
                 }
             }
 
@@ -2509,10 +2666,65 @@ async function runExecutionEngineTick() {
         }
 
         executionEngineState.lastDecisionAt = Date.now();
-        const payload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
+        let binancePayload = null;
+        let bithumbPayload = null;
+
+        if (action === 'ENTRY') {
+            bithumbPayload = await placeExecutionEngineBithumbOrder(
+                bithumbSide,
+                spotOrderAmount,
+                marketSnapshot,
+                premiumValue,
+                { strategyAction: 'ENTRY_BUY' }
+            );
+            try {
+                binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
+            } catch (error) {
+                try {
+                    await placeExecutionEngineBithumbOrder(
+                        'sell',
+                        spotOrderAmount,
+                        marketSnapshot,
+                        premiumValue,
+                        { strategyAction: 'EXIT_SELL', allowInSafeMode: true, idempotencyKeyPrefix: 'engine-rollback' }
+                    );
+                } catch (rollbackError) {
+                    recordRuntimeEvent('error', 'execution_engine_bithumb_rollback_failure', {
+                        action,
+                        error: toErrorMessage(rollbackError),
+                    });
+                }
+                throw error;
+            }
+        } else {
+            binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
+            try {
+                bithumbPayload = await placeExecutionEngineBithumbOrder(
+                    bithumbSide,
+                    spotOrderAmount,
+                    marketSnapshot,
+                    premiumValue,
+                    { strategyAction: 'EXIT_SELL' }
+                );
+            } catch (error) {
+                try {
+                    await placeExecutionEngineOrder('sell', orderAmount, marketSnapshot, premiumValue, {
+                        allowInSafeMode: true,
+                        idempotencyKeyPrefix: 'engine-rollback',
+                    });
+                } catch (rollbackError) {
+                    recordRuntimeEvent('error', 'execution_engine_binance_rollback_failure', {
+                        action,
+                        error: toErrorMessage(rollbackError),
+                    });
+                }
+                throw error;
+            }
+        }
+
         executionEngineState.lastOrderAt = Date.now();
         executionEngineState.lastOrderSide = side;
-        executionEngineState.lastOrderId = normalizeExecutionOrderIdToken(payload?.order?.id, 120);
+        executionEngineState.lastOrderId = normalizeExecutionOrderIdToken(binancePayload?.order?.id, 120);
         executionEngineState.lastOrderAmount = orderAmount;
         executionEngineState.lastOrderError = null;
 
@@ -2532,7 +2744,9 @@ async function runExecutionEngineTick() {
             entryThreshold: round(entryThreshold, 4),
             exitThreshold: round(exitThreshold, 4),
             orderAmount: round(orderAmount, 8),
+            spotOrderAmount: round(spotOrderAmount, 8),
             orderId: executionEngineState.lastOrderId,
+            spotOrderId: bithumbPayload?.order?.id ?? null,
         });
 
         const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
@@ -2546,7 +2760,8 @@ async function runExecutionEngineTick() {
             fields: [
                 { name: '김프', value: `${round(premiumValue, 4)}%` },
                 { name: '기준가', value: `${action === 'ENTRY' ? entryThreshold : exitThreshold}%` },
-                { name: '주문수량', value: `${round(orderAmount, 8)}` },
+                { name: '선물수량', value: `${round(orderAmount, 8)}` },
+                { name: '현물수량', value: `${round(spotOrderAmount, 8)}` },
                 { name: 'DryRun', value: executionEngineState.dryRun ? '✅ 시뮬' : '❌ 실매매' },
                 { name: 'Order ID', value: executionEngineState.lastOrderId ?? 'N/A', inline: false },
                 ...marketFields,
@@ -2601,6 +2816,10 @@ async function startExecutionEngine({
 
         if (!binanceExecutionTestnet && !executionAllowLiveOrders) {
             throw new Error('EXECUTION_ALLOW_LIVE_ORDERS is disabled');
+        }
+
+        if (!hasBithumbExecutionCredentials()) {
+            throw new Error('BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured');
         }
     }
 
@@ -5526,6 +5745,7 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
     const checks = [];
     const safety = getExecutionSafetySummary();
     const credentialsConfigured = hasBinanceExecutionCredentials();
+    const bithumbCredentialsConfigured = hasBithumbExecutionCredentials();
 
     checks.push({
         key: 'credentials_configured',
@@ -5534,6 +5754,15 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
         message: credentialsConfigured
             ? 'BINANCE_API_KEY/BINANCE_API_SECRET configured'
             : 'BINANCE_API_KEY/BINANCE_API_SECRET is not configured',
+    });
+
+    checks.push({
+        key: 'bithumb_credentials_configured',
+        ok: bithumbCredentialsConfigured,
+        severity: mode === 'dryrun' ? 'warn' : 'error',
+        message: bithumbCredentialsConfigured
+            ? 'BITHUMB_API_KEY/BITHUMB_API_SECRET configured'
+            : 'BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured',
     });
 
     checks.push({
@@ -5621,6 +5850,31 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
         message: connectivityOk
             ? 'exchange connectivity check passed'
             : `exchange connectivity check failed: ${connectivityError}`,
+    });
+
+    let bithumbConnectivityOk = false;
+    let bithumbConnectivityError = null;
+    if (bithumbCredentialsConfigured) {
+        try {
+            const client = await getBithumbExecutionClient(mode === 'live');
+            await client.fetchBalance();
+            bithumbConnectivityOk = true;
+        } catch (error) {
+            bithumbConnectivityOk = false;
+            bithumbConnectivityError = toErrorMessage(error);
+        }
+    } else {
+        bithumbConnectivityOk = false;
+        bithumbConnectivityError = 'Bithumb credentials not configured';
+    }
+
+    checks.push({
+        key: 'bithumb_connectivity',
+        ok: bithumbConnectivityOk,
+        severity: mode === 'dryrun' ? 'warn' : 'error',
+        message: bithumbConnectivityOk
+            ? 'bithumb connectivity check passed'
+            : `bithumb connectivity check failed: ${bithumbConnectivityError}`,
     });
 
     const blockingFailures = checks.filter((check) => !check.ok && check.severity === 'error');
@@ -6014,6 +6268,16 @@ app.post('/api/execution/engine/start', async (req, res) => {
         if (!hasBinanceExecutionCredentials()) {
             res.status(400).json({
                 error: 'BINANCE_API_KEY/BINANCE_API_SECRET is not configured',
+                timestamp: Date.now(),
+                safety: getExecutionSafetySummary(),
+                engine: getExecutionEngineSnapshot(),
+            });
+            return;
+        }
+
+        if (!hasBithumbExecutionCredentials()) {
+            res.status(400).json({
+                error: 'BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured',
                 timestamp: Date.now(),
                 safety: getExecutionSafetySummary(),
                 engine: getExecutionEngineSnapshot(),
@@ -6860,9 +7124,12 @@ app.post('/api/execution/bithumb/order', async (req, res) => {
             { name: '상태', value: '✅ 체결 완료', inline: true },
         ];
         if (strategyContext) {
+            const isEntryAction =
+                strategyContext.action === 'ENTRY_SELL' ||
+                strategyContext.action === 'ENTRY_BUY';
             discordFields.push({
                 name: '전략',
-                value: `${strategyContext.action === 'ENTRY_SELL' ? '🔴 진입' : '🟢 청산'} (김프: ${strategyContext.effectivePremiumPct ?? strategyContext.premiumPct}%)`,
+                value: `${isEntryAction ? '🔴 진입' : '🟢 청산'} (김프: ${strategyContext.effectivePremiumPct ?? strategyContext.premiumPct}%)`,
                 inline: false
             });
         }
