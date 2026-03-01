@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Activity, Play, Pause, Zap, DollarSign, RefreshCw, TrendingUp } from 'lucide-react';
+import { Activity, Play, Pause, Zap, DollarSign, RefreshCw, TrendingUp, Plus, X, Save } from 'lucide-react';
 import { MetricCard } from './components/MetricCard';
 import { MultiCoinPremiumHeader, MultiCoinPremiumTable } from './components/MultiCoinPremiumTable';
 import { BacktestPanel } from './components/BacktestPanel';
 import { PremiumChart } from './components/PremiumChart';
 import {
+  BithumbExecutionPortfolioResponse,
   ExecutionCredentialsStatusResponse,
   ExecutionEngineReadinessResponse,
   BinanceExecutionFill,
@@ -27,6 +28,7 @@ import {
   fetchExecutionEngineReadiness,
   fetchExecutionFills,
   fetchExecutionPortfolio,
+  fetchBithumbExecutionPortfolio,
   fetchExecutionPosition,
   fetchExecutionSafety,
   fetchExecutionStatus,
@@ -40,6 +42,7 @@ import {
   sendDiscordTest,
   DiscordConfigResponse,
   DiscordNotificationSettings,
+  PremiumAlertThreshold,
 } from './services/marketService';
 
 const POLLING_INTERVAL_MS = 3000;
@@ -66,12 +69,13 @@ const App: React.FC = () => {
   // Execution State
   const [executionMarketType, setExecutionMarketType] = useState<ExecutionMarketType>('coinm');
   const [executionSymbol, setExecutionSymbol] = useState<string>(defaultSymbolByMarketType('coinm'));
-  const [executionAmount, setExecutionAmount] = useState<number>(1);
   const [executionDryRun, setExecutionDryRun] = useState<boolean>(true);
+  const [executionOrderBalancePct, setExecutionOrderBalancePct] = useState<number>(10);
   const [executionStatus, setExecutionStatus] = useState<BinanceExecutionStatusResponse | null>(null);
   const [executionSafety, setExecutionSafety] = useState<ExecutionSafetyResponse | null>(null);
   const [executionPosition, setExecutionPosition] = useState<BinanceExecutionPositionResponse | null>(null);
   const [executionPortfolio, setExecutionPortfolio] = useState<BinanceExecutionPortfolioResponse | null>(null);
+  const [bithumbPortfolio, setBithumbPortfolio] = useState<BithumbExecutionPortfolioResponse | null>(null);
   const [executionFills, setExecutionFills] = useState<BinanceExecutionFill[]>([]);
   const [executionEvents, setExecutionEvents] = useState<ExecutionEventsResponse['events']>([]);
   const [executionEngineStatus, setExecutionEngineStatus] = useState<ExecutionEngineStatusResponse | null>(null);
@@ -79,8 +83,11 @@ const App: React.FC = () => {
   const [executionCredentialsStatus, setExecutionCredentialsStatus] = useState<ExecutionCredentialsStatusResponse | null>(null);
   const [executionApiKeyInput, setExecutionApiKeyInput] = useState<string>('');
   const [executionApiSecretInput, setExecutionApiSecretInput] = useState<string>('');
+  const [bithumbApiKeyInput, setBithumbApiKeyInput] = useState<string>('');
+  const [bithumbApiSecretInput, setBithumbApiSecretInput] = useState<string>('');
   const [executionCredentialPersist, setExecutionCredentialPersist] = useState<boolean>(true);
   const [executionError, setExecutionError] = useState<string | null>(null);
+  const [bithumbExecutionError, setBithumbExecutionError] = useState<string | null>(null);
   const [isExecutionRefreshing, setIsExecutionRefreshing] = useState<boolean>(false);
   const [isEngineSubmitting, setIsEngineSubmitting] = useState<boolean>(false);
   const [isCredentialSubmitting, setIsCredentialSubmitting] = useState<boolean>(false);
@@ -93,8 +100,10 @@ const App: React.FC = () => {
   const [discordMessage, setDiscordMessage] = useState<string | null>(null);
   // Discord notification settings state
   const [premiumAlertEnabled, setPremiumAlertEnabled] = useState<boolean>(false);
-  const [premiumAlertThresholdHigh, setPremiumAlertThresholdHigh] = useState<number>(3.0);
-  const [premiumAlertThresholdLow, setPremiumAlertThresholdLow] = useState<number>(-1.0);
+  const [premiumAlertThresholds, setPremiumAlertThresholds] = useState<PremiumAlertThreshold[]>([
+    { id: 'default-high', value: 3.0 },
+    { id: 'default-low', value: -1.0 },
+  ]);
   const [periodicReportEnabled, setPeriodicReportEnabled] = useState<boolean>(true);
   const [reportIntervalMinutes, setReportIntervalMinutes] = useState<number>(60);
 
@@ -162,6 +171,10 @@ const App: React.FC = () => {
           symbol: executionSymbol.trim(),
           balanceLimit: 8,
         }),
+        fetchBithumbExecutionPortfolio({
+          symbol: 'BTC/KRW',
+          balanceLimit: 8,
+        }),
         fetchExecutionFills({
           marketType: executionMarketType,
           symbol: executionSymbol.trim(),
@@ -217,21 +230,31 @@ const App: React.FC = () => {
 
       const fillsResult = settled[5];
       if (fillsResult.status === 'fulfilled') {
-        setExecutionFills(fillsResult.value.fills);
+        setBithumbPortfolio(fillsResult.value);
+        setBithumbExecutionError(fillsResult.value.error ?? null);
       } else {
-        errors.push(fillsResult.reason instanceof Error ? fillsResult.reason.message : String(fillsResult.reason));
+        const message = fillsResult.reason instanceof Error ? fillsResult.reason.message : String(fillsResult.reason);
+        setBithumbExecutionError(message);
       }
 
-      const eventsResult = settled[6];
+      const fillsResult2 = settled[6];
+      if (fillsResult2.status === 'fulfilled') {
+        setExecutionFills(fillsResult2.value.fills);
+      } else {
+        errors.push(fillsResult2.reason instanceof Error ? fillsResult2.reason.message : String(fillsResult2.reason));
+      }
+
+      const eventsResult = settled[7];
       if (eventsResult.status === 'fulfilled') {
         setExecutionEvents(eventsResult.value.events);
       } else {
         errors.push(eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason));
       }
 
-      const engineResult = settled[7];
+      const engineResult = settled[8];
       if (engineResult.status === 'fulfilled') {
-        setExecutionEngineStatus(engineResult.value);
+        const engineStatus = engineResult.value;
+        setExecutionEngineStatus(engineStatus);
       } else {
         errors.push(engineResult.reason instanceof Error ? engineResult.reason.message : String(engineResult.reason));
       }
@@ -295,22 +318,33 @@ const App: React.FC = () => {
     };
   }, [refreshExecutionData]);
 
+  const syncDiscordLocalState = useCallback((cfg: DiscordConfigResponse) => {
+    setDiscordConfig(cfg);
+    if (cfg.notifications) {
+      setPremiumAlertEnabled(cfg.notifications.premiumAlertEnabled);
+      // Always reflect server-loaded values as-is so saved settings are shown after reload.
+      setPremiumAlertThresholds(
+        Array.isArray(cfg.notifications.premiumAlertThresholds)
+          ? cfg.notifications.premiumAlertThresholds
+          : []
+      );
+      setPeriodicReportEnabled(cfg.notifications.periodicReportEnabled);
+      setReportIntervalMinutes(cfg.notifications.reportIntervalMinutes);
+    }
+  }, []);
+
   // Fetch discord config on mount
   useEffect(() => {
     void (async () => {
       try {
         const cfg = await fetchDiscordConfig();
-        setDiscordConfig(cfg);
-        if (cfg.notifications) {
-          setPremiumAlertEnabled(cfg.notifications.premiumAlertEnabled);
-          setPremiumAlertThresholdHigh(cfg.notifications.premiumAlertThresholdHigh);
-          setPremiumAlertThresholdLow(cfg.notifications.premiumAlertThresholdLow);
-          setPeriodicReportEnabled(cfg.notifications.periodicReportEnabled);
-          setReportIntervalMinutes(cfg.notifications.reportIntervalMinutes);
-        }
-      } catch { /* silent */ }
+        syncDiscordLocalState(cfg);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '디스코드 설정 로드 실패';
+        setDiscordMessage(`설정 불러오기 실패: ${message}`);
+      }
     })();
-  }, []);
+  }, [syncDiscordLocalState]);
 
   const handleExecutionEngineToggle = useCallback(async () => {
     if (isEngineSubmitting) return;
@@ -324,16 +358,18 @@ const App: React.FC = () => {
         setExecutionEngineStatus(response);
         setExecutionError(null);
       } else {
-        if (!Number.isFinite(executionAmount) || executionAmount <= 0) {
-          setExecutionError('주문 수량은 0보다 커야 합니다.');
-          return;
-        }
-        if (config.entryThreshold <= config.exitThreshold) {
-          setExecutionError('진입(판매) 김프는 청산(구매) 김프보다 커야 합니다.');
-          return;
-        }
         if (!executionDryRun && !executionStatus?.connected) {
           setExecutionError('실주문 모드에서는 먼저 바이낸스 연결 상태가 connected=true 여야 합니다.');
+          return;
+        }
+
+        if (!Number.isFinite(executionOrderBalancePct) || executionOrderBalancePct <= 0 || executionOrderBalancePct > 100) {
+          setExecutionError('주문 비율(%)을 0~100 사이로 입력하세요.');
+          return;
+        }
+
+        if (config.entryThreshold <= config.exitThreshold) {
+          setExecutionError('진입 기준은 청산 기준보다 커야 합니다.');
           return;
         }
 
@@ -352,11 +388,11 @@ const App: React.FC = () => {
         const response = await startExecutionEngine({
           marketType: executionMarketType,
           symbol: executionSymbol.trim() || defaultSymbolByMarketType(executionMarketType),
-          amount: executionAmount,
           dryRun: executionDryRun,
           premiumBasis: 'USD',
           entryThreshold: config.entryThreshold,
           exitThreshold: config.exitThreshold,
+          orderBalancePct: executionOrderBalancePct,
         });
         setExecutionEngineStatus(response);
         setExecutionError(null);
@@ -373,10 +409,10 @@ const App: React.FC = () => {
   }, [
     config.entryThreshold,
     config.exitThreshold,
-    executionAmount,
     executionDryRun,
     executionEngineStatus?.engine.running,
     executionMarketType,
+    executionOrderBalancePct,
     executionStatus?.connected,
     executionSymbol,
     isEngineSubmitting,
@@ -386,21 +422,29 @@ const App: React.FC = () => {
 
   const handleSaveExecutionCredentials = useCallback(async () => {
     if (isCredentialSubmitting) return;
-    if (!executionApiKeyInput.trim() || !executionApiSecretInput.trim()) {
-      setExecutionError('API 키와 시크릿을 모두 입력하세요.');
+
+    const hasBinanceInput = executionApiKeyInput.trim() && executionApiSecretInput.trim();
+    const hasBithumbInput = bithumbApiKeyInput.trim() && bithumbApiSecretInput.trim();
+
+    if (!hasBinanceInput && !hasBithumbInput) {
+      setExecutionError('바이낸스 또는 빗썸의 API 키와 시크릿을 모두 입력하세요.');
       return;
     }
 
     setIsCredentialSubmitting(true);
     try {
       const response = await updateExecutionCredentials({
-        apiKey: executionApiKeyInput.trim(),
-        apiSecret: executionApiSecretInput.trim(),
+        apiKey: hasBinanceInput ? executionApiKeyInput.trim() : undefined,
+        apiSecret: hasBinanceInput ? executionApiSecretInput.trim() : undefined,
+        bithumbApiKey: hasBithumbInput ? bithumbApiKeyInput.trim() : undefined,
+        bithumbApiSecret: hasBithumbInput ? bithumbApiSecretInput.trim() : undefined,
         persist: executionCredentialPersist,
       });
       setExecutionCredentialsStatus(response);
       setExecutionApiKeyInput('');
       setExecutionApiSecretInput('');
+      setBithumbApiKeyInput('');
+      setBithumbApiSecretInput('');
       setExecutionError(null);
       await refreshExecutionData(false);
     } catch (error) {
@@ -412,6 +456,8 @@ const App: React.FC = () => {
   }, [
     executionApiKeyInput,
     executionApiSecretInput,
+    bithumbApiKeyInput,
+    bithumbApiSecretInput,
     executionCredentialPersist,
     isCredentialSubmitting,
     refreshExecutionData,
@@ -514,11 +560,22 @@ const App: React.FC = () => {
     executionCredentialsStatus?.credentials.persisted ??
     executionStatus?.credentialPersisted ??
     false;
+
+  const bithumbConfigured = executionCredentialsStatus?.credentials.bithumb?.configured ?? false;
+  const bithumbCredentialSource = executionCredentialsStatus?.credentials.bithumb?.source ?? 'none';
+  const bithumbCredentialHint = executionCredentialsStatus?.credentials.bithumb?.keyHint;
+  const bithumbCredentialUpdatedAt = executionCredentialsStatus?.credentials.bithumb?.updatedAt;
+  const bithumbCredentialPersisted = executionCredentialsStatus?.credentials.bithumb?.persisted ?? false;
+
   const executionSafeMode = executionSafety?.safety?.safeMode ?? false;
   const isPlaying = executionEngineStatus?.engine.running ?? false;
   const enginePositionState = executionEngineStatus?.engine.positionState ?? 'IDLE';
   const engineLastPremium = executionEngineStatus?.engine.lastPremium ?? null;
   const executionPortfolioSummary = executionPortfolio?.summary;
+  const bithumbPortfolioSummary = bithumbPortfolio?.summary;
+  const bithumbPortfolioConnected = bithumbPortfolio?.connected ?? false;
+  const bithumbPortfolioConfigured = bithumbPortfolio?.configured ?? false;
+  const bithumbPortfolioError = bithumbPortfolio?.error ?? null;
   const executionPortfolioBalanceAsset =
     executionPortfolio?.balanceAsset ??
     executionStatus?.balance?.asset ??
@@ -551,6 +608,8 @@ const App: React.FC = () => {
       : null;
   const executionBalanceText =
     `${executionPortfolioBalanceAsset} ${formatNullableNumber(executionWalletFree, 8)}`;
+  const bithumbKrwTotal = bithumbPortfolioSummary?.walletAssetTotal ?? null;
+  const bithumbKrwFree = bithumbPortfolioSummary?.walletAssetFree ?? null;
   const sidebarSections: Array<{ key: SidebarSection; label: string; description: string }> = [
     { key: 'automation', label: '자동매매', description: '실행 설정/리스크' },
     { key: 'portfolio', label: '포트폴리오', description: '잔고/체결/이벤트' },
@@ -673,38 +732,44 @@ const App: React.FC = () => {
 
                 {/* Top Metrics Row */}
                 {isAutomationTab && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
                     <MetricCard
-                      title="BTC 김프 (USD)"
-                      value={`${currentData.kimchiPremiumPercent.toFixed(2)}%`}
-                      subValue={`리얼환율: ${currentData.exchangeRate.toFixed(1)}`}
+                      title="P값 (합성환율)"
+                      value={`₩${(currentData.krwPrice / currentData.usdPrice).toLocaleString(undefined, { maximumFractionDigits: 1 })}`}
+                      subValue={`리얼환율 대비: ${(currentData.kimchiPremiumPercent > 0 ? '+' : '')}${currentData.kimchiPremiumPercent.toFixed(2)}%`}
                       trend={currentData.kimchiPremiumPercent > 0 ? 'up' : 'down'}
                       icon={<Zap size={16} strokeWidth={2.5} />}
                       highlight={currentData.kimchiPremiumPercent > (config.entryThreshold || 3)}
                     />
                     <MetricCard
-                      title="USDT 실질 김프"
-                      value={`${(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent).toFixed(2)}%`}
-                      subValue={`USDT-P: ${(currentData.usdtPremiumPercent ?? 0).toFixed(2)}%`}
-                      trend={(currentData.kimchiPremiumPercentUsdt ?? currentData.kimchiPremiumPercent) > 0 ? 'up' : 'down'}
+                      title="김치 프리미엄 (%)"
+                      value={`${currentData.kimchiPremiumPercent.toFixed(2)}%`}
+                      subValue={`진입 기준: ${config.entryThreshold}%`}
+                      trend={currentData.kimchiPremiumPercent > 0 ? 'up' : 'down'}
                       icon={<Activity size={16} />}
                     />
                     <MetricCard
-                      title="국내 시세 (KRW)"
+                      title="국내 비트코인 (KRW)"
                       value={`₩${Math.round(currentData.krwPrice / 10000).toLocaleString()}만`}
                       subValue={`${currentData.btcSource ?? 'Bithumb'}`}
                       icon={<TrendingUp size={16} />}
                     />
                     <MetricCard
-                      title="해외 시세 (USD)"
+                      title="해외 비트코인 (USD)"
                       value={`$${(currentData.usdPrice).toLocaleString(undefined, { maximumFractionDigits: 0 })}`}
                       subValue={`${currentData.globalSource ?? 'Binance COIN-M'}`}
                       icon={<Activity size={16} />}
                     />
                     <MetricCard
-                      title="환율 (USD/KRW)"
+                      title="리얼 환율 (USD/KRW)"
                       value={`₩${currentData.exchangeRate.toLocaleString(undefined, { maximumFractionDigits: 1 })}`}
-                      subValue={`USDT: ₩${currentData.usdtKrwRate?.toFixed(1) ?? '-'}`}
+                      subValue="은행 기준"
+                      icon={<DollarSign size={16} />}
+                    />
+                    <MetricCard
+                      title="빗썸 환율 (USDT/KRW)"
+                      value={`₩${currentData.usdtKrwRate?.toLocaleString(undefined, { maximumFractionDigits: 1 }) ?? '-'}`}
+                      subValue={`USDT-P: ${(currentData.usdtPremiumPercent ?? 0).toFixed(2)}%`}
                       icon={<DollarSign size={16} />}
                     />
                   </div>
@@ -824,6 +889,68 @@ const App: React.FC = () => {
                       </div>
                     </div>
 
+                    {/* Bithumb API Key Management */}
+                    <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
+                      <h3 className="text-lg font-semibold text-slate-200 mb-4">빗썸 API 키 관리</h3>
+                      <div className="space-y-3">
+                        <div className="text-[11px] text-slate-500 space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span>현재 키 설정: {bithumbConfigured ? '✅ 설정됨' : '❌ 미설정'}</span>
+                            <span className="opacity-40">|</span>
+                            {/* TODO: Add Bithumb connection state later when we add Bithumb trading API */}
+                            <span>빗썸 연결: {bithumbConfigured ? '⚪ 테스트 대기중' : '⚪ 미설정'}</span>
+                          </div>
+                          <div className="pt-1 opacity-70">
+                            source: {bithumbCredentialSource}
+                            {bithumbCredentialHint ? ` · ${bithumbCredentialHint}` : ''}
+                            {bithumbCredentialUpdatedAt ? ` · ${new Date(bithumbCredentialUpdatedAt).toLocaleTimeString('ko-KR')}` : ''}
+                            {bithumbCredentialPersisted ? ' · persisted' : ''}
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={bithumbApiKeyInput}
+                            onChange={(e) => setBithumbApiKeyInput(e.target.value)}
+                            placeholder="BITHUMB_API_KEY (Connect Key)"
+                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-cyan-500 outline-none"
+                          />
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={bithumbApiSecretInput}
+                            onChange={(e) => setBithumbApiSecretInput(e.target.value)}
+                            placeholder="BITHUMB_API_SECRET (Secret Key)"
+                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-cyan-500 outline-none"
+                          />
+                        </div>
+                        <label className="text-[11px] text-slate-400 inline-flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={executionCredentialPersist}
+                            onChange={(e) => setExecutionCredentialPersist(e.target.checked)}
+                            className="accent-cyan-500 w-3.5 h-3.5 rounded border-slate-700 bg-slate-800"
+                          />
+                          서버 재시작 후에도 키 유지(.runtime 저장)
+                        </label>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => void handleSaveExecutionCredentials()}
+                            disabled={isCredentialSubmitting}
+                            className="px-3 py-1.5 rounded bg-cyan-900/30 border border-cyan-800/50 text-xs font-semibold text-cyan-200 hover:bg-cyan-900/40 disabled:opacity-60 transition-colors"
+                          >
+                            {isCredentialSubmitting ? '저장 중...' : '키 저장/적용'}
+                          </button>
+                        </div>
+                        {bithumbExecutionError && (
+                          <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2 mt-2">
+                            빗썸 오류: {bithumbExecutionError}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
                     {/* Discord Webhook Config */}
                     <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6">
                       <h3 className="text-lg font-semibold text-slate-200 mb-4">디스코드 웹훅 설정</h3>
@@ -847,11 +974,10 @@ const App: React.FC = () => {
                               setDiscordMessage(null);
                               try {
                                 const result = await updateDiscordConfig(discordWebhookInput.trim());
-                                setDiscordConfig({ configured: result.configured, webhookUrlMasked: '', notifications: result.notifications });
                                 setDiscordMessage(result.message);
                                 setDiscordWebhookInput('');
                                 const fresh = await fetchDiscordConfig();
-                                setDiscordConfig(fresh);
+                                syncDiscordLocalState(fresh);
                               } catch (e) {
                                 setDiscordMessage(e instanceof Error ? e.message : '오류 발생');
                               } finally {
@@ -889,13 +1015,13 @@ const App: React.FC = () => {
                                 try {
                                   const result = await updateDiscordConfig('', {
                                     premiumAlertEnabled,
-                                    premiumAlertThresholdHigh,
-                                    premiumAlertThresholdLow,
+                                    premiumAlertThresholds,
                                     periodicReportEnabled,
                                     reportIntervalMinutes,
                                   });
-                                  setDiscordConfig({ configured: result.configured, webhookUrlMasked: '', notifications: result.notifications });
                                   setDiscordMessage('웹훅 URL 삭제됨');
+                                  const fresh = await fetchDiscordConfig();
+                                  syncDiscordLocalState(fresh);
                                 } catch (e) {
                                   setDiscordMessage(e instanceof Error ? e.message : '오류');
                                 } finally {
@@ -939,30 +1065,48 @@ const App: React.FC = () => {
                           </label>
                           {premiumAlertEnabled && (
                             <div className="ml-6 space-y-2">
-                              <div className="grid grid-cols-2 gap-2">
-                                <label className="text-slate-400 flex flex-col gap-1 text-xs">
-                                  🔺 상한 김프 (%)
+                              {premiumAlertThresholds.map((threshold, index) => (
+                                <div key={threshold.id} className="flex items-center gap-2">
                                   <input
                                     type="number"
                                     step={0.1}
-                                    value={premiumAlertThresholdHigh}
-                                    onChange={(e) => setPremiumAlertThresholdHigh(Number(e.target.value))}
-                                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-indigo-500 outline-none"
+                                    value={threshold.value}
+                                    onChange={(e) => {
+                                      const updated = [...premiumAlertThresholds];
+                                      updated[index] = { ...updated[index], value: Number(e.target.value) };
+                                      setPremiumAlertThresholds(updated);
+                                    }}
+                                    className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono text-xs focus:ring-1 focus:ring-indigo-500 outline-none"
                                   />
-                                </label>
-                                <label className="text-slate-400 flex flex-col gap-1 text-xs">
-                                  🔻 하한 김프 (%)
-                                  <input
-                                    type="number"
-                                    step={0.1}
-                                    value={premiumAlertThresholdLow}
-                                    onChange={(e) => setPremiumAlertThresholdLow(Number(e.target.value))}
-                                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-indigo-500 outline-none"
-                                  />
-                                </label>
-                              </div>
+                                  <span className="text-xs text-slate-500">%</span>
+                                  <button
+                                    onClick={() => setPremiumAlertThresholds(premiumAlertThresholds.filter((_, i) => i !== index))}
+                                    className="p-1.5 rounded bg-slate-800 border border-slate-700 text-slate-400 hover:text-rose-400 hover:border-rose-800 transition-colors shrink-0"
+                                    title="삭제"
+                                  >
+                                    <X size={14} />
+                                  </button>
+                                </div>
+                              ))}
+                              {premiumAlertThresholds.length < 10 && (
+                                <button
+                                  onClick={() => {
+                                    setPremiumAlertThresholds([
+                                      ...premiumAlertThresholds,
+                                      {
+                                        id: `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                                        value: 0,
+                                      },
+                                    ]);
+                                  }}
+                                  className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200 transition-colors px-2 py-1.5 rounded bg-indigo-950/30 border border-indigo-800/40 hover:bg-indigo-950/50"
+                                >
+                                  <Plus size={14} />
+                                  임계값 추가
+                                </button>
+                              )}
                               <p className="text-[10px] text-slate-600">
-                                김프가 상한 이상 또는 하한 이하가 되면 디스코드로 알림을 보냅니다. (쿨다운: 10분)
+                                김프가 설정한 값을 넘거나 내려가면 디스코드로 알림을 보냅니다. (쿨다운: 10분)
                               </p>
                             </div>
                           )}
@@ -1005,20 +1149,19 @@ const App: React.FC = () => {
                             setIsDiscordSubmitting(true);
                             setDiscordMessage(null);
                             try {
-                              const webhookUrl = discordConfig?.configured
-                                ? (discordConfig.webhookUrlMasked ? '__KEEP__' : '')
-                                : '';
+                              const webhookUrl = discordWebhookInput.trim() || (discordConfig?.configured ? '__KEEP__' : '');
                               const result = await updateDiscordConfig(
                                 webhookUrl,
                                 {
                                   premiumAlertEnabled,
-                                  premiumAlertThresholdHigh,
-                                  premiumAlertThresholdLow,
+                                  premiumAlertThresholds,
                                   periodicReportEnabled,
                                   reportIntervalMinutes,
                                 }
                               );
-                              setDiscordConfig(prev => prev ? { ...prev, notifications: result.notifications } : prev);
+                              setDiscordWebhookInput('');
+                              const fresh = await fetchDiscordConfig();
+                              syncDiscordLocalState(fresh);
                               setDiscordMessage('알림 설정이 저장되었습니다.');
                             } catch (e) {
                               setDiscordMessage(e instanceof Error ? e.message : '설정 저장 실패');
@@ -1026,13 +1169,13 @@ const App: React.FC = () => {
                               setIsDiscordSubmitting(false);
                             }
                           }}
-                          disabled={isDiscordSubmitting || !discordConfig?.configured}
+                          disabled={isDiscordSubmitting || (!discordConfig?.configured && discordWebhookInput.trim().length === 0)}
                           className="w-full px-3 py-2 rounded bg-indigo-900/30 border border-indigo-800/50 text-sm font-semibold text-indigo-200 hover:bg-indigo-900/40 disabled:opacity-60 transition-colors"
                         >
                           {isDiscordSubmitting ? '저장 중...' : '📥 알림 설정 저장'}
                         </button>
 
-                        {!discordConfig?.configured && (
+                        {!discordConfig?.configured && discordWebhookInput.trim().length === 0 && (
                           <p className="text-[10px] text-amber-400/70">
                             ⚠️ 웹훅 URL을 먼저 설정해야 알림 기능을 사용할 수 있습니다.
                           </p>
@@ -1064,58 +1207,27 @@ const App: React.FC = () => {
                             </select>
                           </label>
                           <label className="text-slate-400 flex flex-col gap-1">
-                            주문 수량
+                            심볼
                             <input
-                              type="number"
-                              min={0.0001}
-                              step={0.0001}
-                              value={executionAmount}
-                              onChange={(e) => setExecutionAmount(Math.max(0, Number(e.target.value)))}
-                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
-                            />
-                          </label>
-                        </div>
-
-                        <div className="grid grid-cols-2 gap-2">
-                          <label className="text-slate-400 flex flex-col gap-1">
-                            진입(판매) 김프 %
-                            <input
-                              type="number"
-                              step={0.1}
-                              value={config.entryThreshold}
-                              onChange={(e) =>
-                                setConfig((prev) => ({
-                                  ...prev,
-                                  entryThreshold: Number(e.target.value),
-                                }))
-                              }
-                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
-                            />
-                          </label>
-                          <label className="text-slate-400 flex flex-col gap-1">
-                            청산(구매) 김프 %
-                            <input
-                              type="number"
-                              step={0.1}
-                              value={config.exitThreshold}
-                              onChange={(e) =>
-                                setConfig((prev) => ({
-                                  ...prev,
-                                  exitThreshold: Number(e.target.value),
-                                }))
-                              }
+                              type="text"
+                              value={executionSymbol}
+                              onChange={(e) => setExecutionSymbol(e.target.value)}
                               className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
                             />
                           </label>
                         </div>
 
                         <label className="text-slate-400 flex flex-col gap-1">
-                          심볼
+                          주문 비율 (%)
                           <input
-                            type="text"
-                            value={executionSymbol}
-                            onChange={(e) => setExecutionSymbol(e.target.value)}
+                            type="number"
+                            min={0.1}
+                            max={100}
+                            step={0.1}
+                            value={Number.isFinite(executionOrderBalancePct) ? executionOrderBalancePct : 0}
+                            onChange={(e) => setExecutionOrderBalancePct(Number(e.target.value))}
                             className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                            placeholder="예: 10"
                           />
                         </label>
 
@@ -1301,6 +1413,62 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
+                  <div className="border border-slate-800 rounded-lg overflow-hidden mb-4">
+                    <div className="px-3 py-2 text-xs text-slate-400 bg-slate-950/50 border-b border-slate-800 flex items-center justify-between">
+                      <span>빗썸 현물 잔고</span>
+                      <span className={`text-[10px] ${bithumbPortfolioConnected ? 'text-emerald-400' : 'text-slate-500'}`}>
+                        {bithumbPortfolioConnected ? '연결됨' : bithumbPortfolioConfigured ? '연결 실패' : '미설정'}
+                      </span>
+                    </div>
+                    <div className="p-3 space-y-3">
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <div className="text-slate-500">KRW 총 보유</div>
+                          <div className="text-slate-200 font-mono">₩{formatNullableNumber(bithumbKrwTotal, 0)}</div>
+                        </div>
+                        <div className="rounded border border-slate-800 bg-slate-950/40 px-3 py-2">
+                          <div className="text-slate-500">KRW 가용 잔고</div>
+                          <div className="text-slate-200 font-mono">₩{formatNullableNumber(bithumbKrwFree, 0)}</div>
+                        </div>
+                      </div>
+                      {bithumbPortfolioError && (
+                        <div className="text-xs text-rose-300 bg-rose-950/30 border border-rose-800/50 rounded px-3 py-2">
+                          빗썸 잔고 조회 오류: {bithumbPortfolioError}
+                        </div>
+                      )}
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full text-xs">
+                          <thead>
+                            <tr className="text-slate-500 border-b border-slate-800">
+                              <th className="py-2 px-3 text-left">자산</th>
+                              <th className="py-2 px-3 text-right">총</th>
+                              <th className="py-2 px-3 text-right">가용</th>
+                              <th className="py-2 px-3 text-right">사용</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(bithumbPortfolio?.walletBalances ?? []).length === 0 ? (
+                              <tr>
+                                <td colSpan={4} className="py-4 text-center text-slate-500">
+                                  표시할 빗썸 잔고가 없습니다.
+                                </td>
+                              </tr>
+                            ) : (
+                              (bithumbPortfolio?.walletBalances ?? []).map((item) => (
+                                <tr key={`b-${item.asset}`} className="border-b border-slate-900/70">
+                                  <td className="py-2 px-3 text-slate-300 font-medium">{item.asset}</td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.total, 8)}</td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.free, 8)}</td>
+                                  <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.used, 8)}</td>
+                                </tr>
+                              ))
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                     <div className="border border-slate-800 rounded-lg overflow-hidden">
                       <div className="px-3 py-2 text-xs text-slate-400 bg-slate-950/50 border-b border-slate-800">
@@ -1409,13 +1577,13 @@ const App: React.FC = () => {
                         <thead>
                           <tr className="text-slate-400 border-b border-slate-800">
                             <th className="py-2 pr-2 text-left">시간</th>
-                            <th className="py-2 pr-2 text-left">구분</th>
-                            <th className="py-2 pr-2 text-right">김프%</th>
-                            <th className="py-2 pr-2 text-right">실질김프%</th>
+                            <th className="py-2 pr-2 text-left">체결</th>
+                            <th className="py-2 pr-2 text-right">합성환율(P)</th>
+                            <th className="py-2 pr-2 text-right">김치프리미엄%</th>
+                            <th className="py-2 pr-2 text-right">국내 BTC</th>
+                            <th className="py-2 pr-2 text-right">해외 BTC</th>
+                            <th className="py-2 pr-2 text-right">USD/KRW</th>
                             <th className="py-2 pr-2 text-right">USDT/KRW</th>
-                            <th className="py-2 pr-2 text-right">수량</th>
-                            <th className="py-2 pr-2 text-right">가격</th>
-                            <th className="py-2 text-right">PNL</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1426,42 +1594,46 @@ const App: React.FC = () => {
                               </td>
                             </tr>
                           ) : (
-                            executionFills.slice(0, 12).map((fill, index) => (
-                              <tr key={`${fill.id ?? 'fill'}-${index}`} className="border-b border-slate-900/70">
-                                <td className="py-2 pr-2 text-slate-300">
-                                  {fill.timestamp ? new Date(fill.timestamp).toLocaleString('ko-KR') : '-'}
-                                </td>
-                                <td className={`py-2 pr-2 ${fill.side === 'buy' ? 'text-indigo-300' : 'text-emerald-300'}`}>
-                                  {fill.strategyContext?.action === 'ENTRY_SELL'
-                                    ? '진입(SELL)'
-                                    : fill.strategyContext?.action === 'EXIT_BUY'
-                                      ? '청산(BUY)'
-                                      : fill.side === 'sell'
-                                        ? '진입(SELL)'
-                                        : fill.side === 'buy'
-                                          ? '청산(BUY)'
-                                          : '-'}
-                                </td>
-                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
-                                  {fill.strategyContext?.premiumPct != null
-                                    ? `${fill.strategyContext.premiumPct.toFixed(2)}%`
-                                    : '-'}
-                                </td>
-                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
-                                  {fill.strategyContext?.effectivePremiumPct != null
-                                    ? `${fill.strategyContext.effectivePremiumPct.toFixed(2)}%`
-                                    : '-'}
-                                </td>
-                                <td className="py-2 pr-2 text-right font-mono text-slate-300">
-                                  {fill.strategyContext?.usdtKrwRate != null
-                                    ? fill.strategyContext.usdtKrwRate.toFixed(2)
-                                    : '-'}
-                                </td>
-                                <td className="py-2 pr-2 text-right font-mono text-slate-300">{fill.amount ?? '-'}</td>
-                                <td className="py-2 pr-2 text-right font-mono text-slate-300">{fill.price ?? '-'}</td>
-                                <td className="py-2 text-right font-mono text-slate-300">{fill.realizedPnl ?? '-'}</td>
-                              </tr>
-                            ))
+                            executionFills.slice(0, 12).map((fill, index) => {
+                              const ctx = fill.strategyContext ?? null;
+                              const syntheticRate =
+                                ctx?.krwPrice != null && ctx?.usdPrice != null && ctx.usdPrice > 0
+                                  ? ctx.krwPrice / ctx.usdPrice
+                                  : null;
+                              const premium =
+                                ctx?.effectivePremiumPct != null
+                                  ? ctx.effectivePremiumPct
+                                  : ctx?.premiumPct != null
+                                    ? ctx.premiumPct
+                                    : null;
+
+                              return (
+                                <tr key={`${fill.id ?? 'fill'}-${index}`} className="border-b border-slate-900/70">
+                                  <td className="py-2 pr-2 text-slate-300">
+                                    {fill.timestamp ? new Date(fill.timestamp).toLocaleString('ko-KR') : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-emerald-300 font-medium">성공</td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {syntheticRate != null ? syntheticRate.toFixed(2) : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {premium != null ? `${premium.toFixed(2)}%` : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {ctx?.krwPrice != null ? `₩${Math.round(ctx.krwPrice).toLocaleString()}` : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {ctx?.usdPrice != null ? `$${ctx.usdPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {ctx?.exchangeRate != null ? ctx.exchangeRate.toFixed(2) : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-right font-mono text-slate-300">
+                                    {ctx?.usdtKrwRate != null ? ctx.usdtKrwRate.toFixed(2) : '-'}
+                                  </td>
+                                </tr>
+                              );
+                            })
                           )}
                         </tbody>
                       </table>

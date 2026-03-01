@@ -51,6 +51,8 @@ const defaultBacktestChartPoints =
         : 2400;
 const envBinanceExecutionApiKey = (process.env.BINANCE_API_KEY ?? '').trim();
 const envBinanceExecutionApiSecret = (process.env.BINANCE_API_SECRET ?? '').trim();
+const envBithumbApiKey = (process.env.BITHUMB_API_KEY ?? '').trim();
+const envBithumbApiSecret = (process.env.BITHUMB_API_SECRET ?? '').trim();
 const rawBinanceExecutionMarketType = (process.env.BINANCE_EXECUTION_MARKET ?? 'coinm').trim().toLowerCase();
 const binanceExecutionMarketType = rawBinanceExecutionMarketType === 'usdm' ? 'usdm' : 'coinm';
 const rawBinanceExecutionTestnet = (process.env.BINANCE_TESTNET ?? 'true').trim().toLowerCase();
@@ -64,13 +66,15 @@ const executionAlertWebhookUrl = (process.env.EXECUTION_ALERT_WEBHOOK_URL ?? '')
 let discordWebhookUrl = (process.env.DISCORD_WEBHOOK_URL ?? '').trim();
 const discordNotificationSettings = {
     premiumAlertEnabled: false,
-    premiumAlertThresholdHigh: 3.0,
-    premiumAlertThresholdLow: -1.0,
+    premiumAlertThresholds: [
+        { id: 'default-high', value: 3.0 },
+        { id: 'default-low', value: -1.0 },
+    ],
     periodicReportEnabled: true,
     reportIntervalMinutes: 60,
 };
 let discordPeriodicReportTimer = null;
-let lastPremiumAlertAt = 0;
+const lastPremiumAlertAtMap = {};
 const PREMIUM_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 const parsedExecutionAlertTimeoutMs = Number(process.env.EXECUTION_ALERT_TIMEOUT_MS);
 const executionAlertTimeoutMs =
@@ -130,10 +134,14 @@ const executionEngineAutoDryRun = !['0', 'false', 'no', 'off'].includes(rawExecu
 const rawExecutionEngineAutoMarketType = (process.env.EXECUTION_ENGINE_AUTO_MARKET_TYPE ?? binanceExecutionMarketType).trim().toLowerCase();
 const executionEngineAutoMarketType = rawExecutionEngineAutoMarketType === 'usdm' ? 'usdm' : 'coinm';
 const executionEngineAutoSymbol = (process.env.EXECUTION_ENGINE_AUTO_SYMBOL ?? '').trim();
-const parsedExecutionEngineAutoAmount = Number(process.env.EXECUTION_ENGINE_AUTO_AMOUNT);
-const executionEngineAutoAmount =
-    Number.isFinite(parsedExecutionEngineAutoAmount) && parsedExecutionEngineAutoAmount > 0
-        ? parsedExecutionEngineAutoAmount
+const parsedExecutionEngineAutoBalancePct = Number(
+    process.env.EXECUTION_ENGINE_AUTO_BALANCE_PCT ?? process.env.EXECUTION_ENGINE_AUTO_AMOUNT
+);
+const executionEngineAutoBalancePct =
+    Number.isFinite(parsedExecutionEngineAutoBalancePct) &&
+        parsedExecutionEngineAutoBalancePct > 0 &&
+        parsedExecutionEngineAutoBalancePct <= 100
+        ? parsedExecutionEngineAutoBalancePct
         : 1;
 const parsedExecutionEngineAutoEntryThreshold = Number(process.env.EXECUTION_ENGINE_AUTO_ENTRY_THRESHOLD);
 const executionEngineAutoEntryThreshold =
@@ -237,6 +245,13 @@ let runtimeBinanceExecutionApiKey = '';
 let runtimeBinanceExecutionApiSecret = '';
 let runtimeBinanceExecutionCredentialsUpdatedAt = null;
 let runtimeBinanceExecutionCredentialsPersisted = false;
+
+let bithumbClient = null; // To be initialized later
+let bithumbClientCacheKey = null;
+let runtimeBithumbApiKey = '';
+let runtimeBithumbApiSecret = '';
+let runtimeBithumbCredentialsUpdatedAt = null;
+let runtimeBithumbCredentialsPersisted = false;
 let lastExecutionAlertSentAt = 0;
 const executionIdempotencyStore = new Map();
 const executionAuthSessions = new Map();
@@ -256,12 +271,13 @@ const executionEngineState = {
     busy: false,
     marketType: binanceExecutionMarketType,
     symbol: defaultExecutionSymbolByMarketType(binanceExecutionMarketType),
-    amount: 1,
+    orderBalancePct: 0,
     dryRun: true,
     premiumBasis: 'USD',
-    entryThreshold: 2.0,
-    exitThreshold: 0.0,
+    entryThreshold: 0,
+    exitThreshold: 0,
     positionState: 'IDLE',
+    positionSideMode: 'UNKNOWN',
     pollIntervalMs: executionEnginePollIntervalMs,
     orderCooldownMs: executionEngineOrderCooldownMs,
     startedAt: null,
@@ -271,6 +287,7 @@ const executionEngineState = {
     lastOrderAt: null,
     lastOrderSide: null,
     lastOrderId: null,
+    lastOrderAmount: null,
     lastPremium: null,
     lastEffectivePremium: null,
     lastMarketDataTimestamp: null,
@@ -963,9 +980,13 @@ let lastDiscordNotificationAt = 0;
 const DISCORD_COOLDOWN_MS = 10_000;
 
 async function sendDiscordNotification({ title, description, color, fields = [] }) {
-    if (!discordWebhookUrl) return;
+    if (!discordWebhookUrl) {
+        return { ok: false, error: 'Discord webhook URL is not configured' };
+    }
     const now = Date.now();
-    if (now - lastDiscordNotificationAt < DISCORD_COOLDOWN_MS) return;
+    if (now - lastDiscordNotificationAt < DISCORD_COOLDOWN_MS) {
+        return { ok: false, error: 'Discord notification cooldown active' };
+    }
     lastDiscordNotificationAt = now;
 
     const embed = {
@@ -984,10 +1005,15 @@ async function sendDiscordNotification({ title, description, color, fields = [] 
             body: JSON.stringify({ embeds: [embed] }),
         });
         if (!response.ok) {
-            console.error(`Discord webhook HTTP ${response.status}`);
+            const message = `Discord webhook HTTP ${response.status}`;
+            console.error(message);
+            return { ok: false, error: message, status: response.status };
         }
+        return { ok: true };
     } catch (err) {
-        console.error(`Discord webhook failed: ${toErrorMessage(err)}`);
+        const message = `Discord webhook failed: ${toErrorMessage(err)}`;
+        console.error(message);
+        return { ok: false, error: message };
     }
 }
 
@@ -1357,17 +1383,61 @@ function getActiveBinanceExecutionCredentials() {
     };
 }
 
-function clearBinanceExecutionClientCache() {
+function getActiveBithumbExecutionCredentials() {
+    const runtimeConfigured =
+        runtimeBithumbApiKey.length > 0 &&
+        runtimeBithumbApiSecret.length > 0;
+    if (runtimeConfigured) {
+        return {
+            configured: true,
+            source: 'runtime',
+            apiKey: runtimeBithumbApiKey,
+            apiSecret: runtimeBithumbApiSecret,
+            keyHint: getRuntimeCredentialMask(runtimeBithumbApiKey),
+            updatedAt: runtimeBithumbCredentialsUpdatedAt,
+            persisted: runtimeBithumbCredentialsPersisted,
+        };
+    }
+
+    const envConfigured =
+        envBithumbApiKey.length > 0 &&
+        envBithumbApiSecret.length > 0;
+    if (envConfigured) {
+        return {
+            configured: true,
+            source: 'env',
+            apiKey: envBithumbApiKey,
+            apiSecret: envBithumbApiSecret,
+            keyHint: getRuntimeCredentialMask(envBithumbApiKey),
+            updatedAt: null,
+            persisted: false,
+        };
+    }
+
+    return {
+        configured: false,
+        source: 'none',
+        apiKey: '',
+        apiSecret: '',
+        keyHint: null,
+        updatedAt: null,
+        persisted: false,
+    };
+}
+
+function clearExecutionClientCaches() {
     binanceExecutionClient = null;
     binanceExecutionClientCacheKey = null;
+    bithumbClient = null;
 }
 
 function persistRuntimeExecutionCredentials(reason = 'update') {
     if (
-        runtimeBinanceExecutionApiKey.length === 0 ||
-        runtimeBinanceExecutionApiSecret.length === 0
+        (runtimeBinanceExecutionApiKey.length === 0 || runtimeBinanceExecutionApiSecret.length === 0) &&
+        (runtimeBithumbApiKey.length === 0 || runtimeBithumbApiSecret.length === 0)
     ) {
         runtimeBinanceExecutionCredentialsPersisted = false;
+        runtimeBithumbCredentialsPersisted = false;
         try {
             if (fs.existsSync(executionCredentialsStateFile)) {
                 fs.unlinkSync(executionCredentialsStateFile);
@@ -1380,20 +1450,24 @@ function persistRuntimeExecutionCredentials(reason = 'update') {
 
     try {
         const payload = {
-            updatedAt: runtimeBinanceExecutionCredentialsUpdatedAt ?? Date.now(),
+            updatedAt: runtimeBinanceExecutionCredentialsUpdatedAt || runtimeBithumbCredentialsUpdatedAt || Date.now(),
             reason,
             credentials: {
                 apiKey: runtimeBinanceExecutionApiKey,
                 apiSecret: runtimeBinanceExecutionApiSecret,
+                bithumbApiKey: runtimeBithumbApiKey,
+                bithumbApiSecret: runtimeBithumbApiSecret,
             },
         };
         fs.writeFileSync(executionCredentialsStateFile, `${JSON.stringify(payload, null, 2)}\n`, {
             encoding: 'utf8',
             mode: 0o600,
         });
-        runtimeBinanceExecutionCredentialsPersisted = true;
+        if (runtimeBinanceExecutionApiKey) runtimeBinanceExecutionCredentialsPersisted = true;
+        if (runtimeBithumbApiKey) runtimeBithumbCredentialsPersisted = true;
     } catch (error) {
         runtimeBinanceExecutionCredentialsPersisted = false;
+        runtimeBithumbCredentialsPersisted = false;
         console.error(`Failed to persist execution credentials: ${toErrorMessage(error)}`);
     }
 }
@@ -1413,20 +1487,38 @@ function restoreRuntimeExecutionCredentialsFromDisk() {
 
         const apiKey = parseOptionalString(credentials.apiKey, 256) ?? '';
         const apiSecret = parseOptionalString(credentials.apiSecret, 256) ?? '';
-        if (!apiKey || !apiSecret) return;
+        let binanceRestored = false;
+        if (apiKey && apiSecret) {
+            runtimeBinanceExecutionApiKey = apiKey;
+            runtimeBinanceExecutionApiSecret = apiSecret;
+            runtimeBinanceExecutionCredentialsUpdatedAt = Number.isFinite(toFiniteNumber(payload?.updatedAt))
+                ? Number(payload.updatedAt)
+                : Date.now();
+            runtimeBinanceExecutionCredentialsPersisted = true;
+            binanceRestored = true;
+        }
 
-        runtimeBinanceExecutionApiKey = apiKey;
-        runtimeBinanceExecutionApiSecret = apiSecret;
-        runtimeBinanceExecutionCredentialsUpdatedAt = Number.isFinite(toFiniteNumber(payload?.updatedAt))
-            ? Number(payload.updatedAt)
-            : Date.now();
-        runtimeBinanceExecutionCredentialsPersisted = true;
-        clearBinanceExecutionClientCache();
+        const bApiKey = parseOptionalString(credentials.bithumbApiKey, 256) ?? '';
+        const bApiSecret = parseOptionalString(credentials.bithumbApiSecret, 256) ?? '';
+        let bithumbRestored = false;
+        if (bApiKey && bApiSecret) {
+            runtimeBithumbApiKey = bApiKey;
+            runtimeBithumbApiSecret = bApiSecret;
+            runtimeBithumbCredentialsUpdatedAt = Number.isFinite(toFiniteNumber(payload?.updatedAt))
+                ? Number(payload.updatedAt)
+                : Date.now();
+            runtimeBithumbCredentialsPersisted = true;
+            bithumbRestored = true;
+        }
 
-        recordRuntimeEvent('info', 'execution_credentials_state_restored', {
-            source: 'disk',
-            updatedAt: runtimeBinanceExecutionCredentialsUpdatedAt,
-        });
+        clearExecutionClientCaches();
+
+        if (binanceRestored || bithumbRestored) {
+            recordRuntimeEvent('info', 'execution_credentials_state_restored', {
+                source: 'disk',
+                updatedAt: payload?.updatedAt || Date.now(),
+            });
+        }
     } catch (error) {
         recordRuntimeEvent('error', 'execution_credentials_state_restore_failed', {
             error: toErrorMessage(error),
@@ -1434,22 +1526,34 @@ function restoreRuntimeExecutionCredentialsFromDisk() {
     }
 }
 
-function setRuntimeExecutionCredentials({ apiKey, apiSecret, persist = true, reason = 'manual-set' }) {
-    const normalizedApiKey = parseOptionalString(apiKey, 256);
-    const normalizedApiSecret = parseOptionalString(apiSecret, 256);
-    if (!normalizedApiKey || !normalizedApiSecret) {
-        throw new Error('apiKey/apiSecret is required');
+function setRuntimeExecutionCredentials({ apiKey, apiSecret, bithumbApiKey, bithumbApiSecret, persist = true, reason = 'manual-set' }) {
+    if (apiKey !== undefined && apiSecret !== undefined) {
+        const normalizedApiKey = parseOptionalString(apiKey, 256);
+        const normalizedApiSecret = parseOptionalString(apiSecret, 256);
+        if (normalizedApiKey && normalizedApiSecret) {
+            runtimeBinanceExecutionApiKey = normalizedApiKey;
+            runtimeBinanceExecutionApiSecret = normalizedApiSecret;
+            runtimeBinanceExecutionCredentialsUpdatedAt = Date.now();
+            if (!persist) runtimeBinanceExecutionCredentialsPersisted = false;
+        }
     }
 
-    runtimeBinanceExecutionApiKey = normalizedApiKey;
-    runtimeBinanceExecutionApiSecret = normalizedApiSecret;
-    runtimeBinanceExecutionCredentialsUpdatedAt = Date.now();
-    clearBinanceExecutionClientCache();
+    if (bithumbApiKey !== undefined && bithumbApiSecret !== undefined) {
+        const normalizedBApiKey = parseOptionalString(bithumbApiKey, 256);
+        const normalizedBApiSecret = parseOptionalString(bithumbApiSecret, 256);
+        if (normalizedBApiKey && normalizedBApiSecret) {
+            runtimeBithumbApiKey = normalizedBApiKey;
+            runtimeBithumbApiSecret = normalizedBApiSecret;
+            runtimeBithumbCredentialsUpdatedAt = Date.now();
+            if (!persist) runtimeBithumbCredentialsPersisted = false;
+        }
+    }
+
+    clearExecutionClientCaches();
 
     if (persist) {
         persistRuntimeExecutionCredentials(reason);
     } else {
-        runtimeBinanceExecutionCredentialsPersisted = false;
         try {
             if (fs.existsSync(executionCredentialsStateFile)) {
                 fs.unlinkSync(executionCredentialsStateFile);
@@ -1470,7 +1574,13 @@ function clearRuntimeExecutionCredentials(reason = 'manual-clear') {
     runtimeBinanceExecutionApiSecret = '';
     runtimeBinanceExecutionCredentialsUpdatedAt = Date.now();
     runtimeBinanceExecutionCredentialsPersisted = false;
-    clearBinanceExecutionClientCache();
+
+    runtimeBithumbApiKey = '';
+    runtimeBithumbApiSecret = '';
+    runtimeBithumbCredentialsUpdatedAt = Date.now();
+    runtimeBithumbCredentialsPersisted = false;
+
+    clearExecutionClientCaches();
     persistRuntimeExecutionCredentials(reason);
 
     recordRuntimeEvent('warn', 'execution_credentials_cleared', {
@@ -1479,24 +1589,40 @@ function clearRuntimeExecutionCredentials(reason = 'manual-clear') {
 }
 
 function getExecutionCredentialsStatusSummary() {
-    const active = getActiveBinanceExecutionCredentials();
+    const activeBinance = getActiveBinanceExecutionCredentials();
+    const activeBithumb = getActiveBithumbExecutionCredentials();
     return {
-        configured: active.configured,
-        source: active.source,
-        keyHint: active.keyHint,
-        updatedAt: active.updatedAt,
-        persisted: active.persisted,
-        envConfigured:
-            envBinanceExecutionApiKey.length > 0 &&
-            envBinanceExecutionApiSecret.length > 0,
-        runtimeConfigured:
-            runtimeBinanceExecutionApiKey.length > 0 &&
-            runtimeBinanceExecutionApiSecret.length > 0,
+        configured: activeBinance.configured,     // legacy
+        source: activeBinance.source,             // legacy
+        keyHint: activeBinance.keyHint,           // legacy
+        updatedAt: activeBinance.updatedAt,       // legacy
+        persisted: activeBinance.persisted,       // legacy
+        envConfigured: envBinanceExecutionApiKey.length > 0 && envBinanceExecutionApiSecret.length > 0, // legacy
+        runtimeConfigured: runtimeBinanceExecutionApiKey.length > 0 && runtimeBinanceExecutionApiSecret.length > 0, // legacy
+
+        binance: {
+            configured: activeBinance.configured,
+            source: activeBinance.source,
+            keyHint: activeBinance.keyHint,
+            updatedAt: activeBinance.updatedAt,
+            persisted: activeBinance.persisted,
+        },
+        bithumb: {
+            configured: activeBithumb.configured,
+            source: activeBithumb.source,
+            keyHint: activeBithumb.keyHint,
+            updatedAt: activeBithumb.updatedAt,
+            persisted: activeBithumb.persisted,
+        }
     };
 }
 
 function hasBinanceExecutionCredentials() {
     return getActiveBinanceExecutionCredentials().configured;
+}
+
+function hasBithumbExecutionCredentials() {
+    return getActiveBithumbExecutionCredentials().configured;
 }
 
 function isExecutionPasswordAuthEnabled() {
@@ -1716,7 +1842,7 @@ function getExecutionEngineSnapshot() {
         busy: executionEngineState.busy,
         marketType: executionEngineState.marketType,
         symbol: executionEngineState.symbol,
-        amount: round(executionEngineState.amount, 8),
+        orderBalancePct: round(executionEngineState.orderBalancePct, 4),
         dryRun: executionEngineState.dryRun,
         premiumBasis: executionEngineState.premiumBasis,
         entryThreshold: round(executionEngineState.entryThreshold, 6),
@@ -1731,6 +1857,7 @@ function getExecutionEngineSnapshot() {
         lastOrderAt: executionEngineState.lastOrderAt,
         lastOrderSide: executionEngineState.lastOrderSide,
         lastOrderId: executionEngineState.lastOrderId,
+        lastOrderAmount: toNullableRounded(executionEngineState.lastOrderAmount, 8),
         lastPremium: executionEngineState.lastPremium,
         lastEffectivePremium: executionEngineState.lastEffectivePremium,
         lastMarketDataTimestamp: executionEngineState.lastMarketDataTimestamp,
@@ -1768,21 +1895,22 @@ function restoreExecutionEngineStateFromDisk() {
         const engine = payload?.engine && typeof payload.engine === 'object' ? payload.engine : null;
         if (!engine) return;
 
-        const marketType = normalizeExecutionMarketType(engine.marketType);
-        const symbol = parseExecutionSymbol(engine.symbol, marketType);
-        const amount = parsePositiveNumber(engine.amount, 1, 0.000001, 1_000_000_000);
-        const premiumBasis = normalizePremiumBasis(engine.premiumBasis);
-        const entryThreshold = parseNumber(engine.entryThreshold, 2.0, -20, 40);
-        const exitThreshold = parseNumber(engine.exitThreshold, 0.0, -20, 40);
-
-        executionEngineState.marketType = marketType;
-        executionEngineState.symbol = symbol;
-        executionEngineState.amount = amount;
+        executionEngineState.marketType = normalizeExecutionMarketType(engine.marketType);
+        executionEngineState.symbol = parseExecutionSymbol(engine.symbol, executionEngineState.marketType);
+        const rawOrderBalancePct = toFiniteNumber(engine.orderBalancePct);
+        const legacyAmount = toFiniteNumber(engine.amount);
+        const resolvedOrderBalancePct = Number.isFinite(rawOrderBalancePct) && rawOrderBalancePct > 0
+            ? Math.min(100, rawOrderBalancePct)
+            : Number.isFinite(legacyAmount) && legacyAmount > 0 && legacyAmount <= 100
+                ? legacyAmount
+                : 0;
+        executionEngineState.orderBalancePct = resolvedOrderBalancePct;
         executionEngineState.dryRun = parseBoolean(engine.dryRun, true);
-        executionEngineState.premiumBasis = premiumBasis;
-        executionEngineState.entryThreshold = entryThreshold;
-        executionEngineState.exitThreshold = exitThreshold;
+        executionEngineState.premiumBasis = normalizePremiumBasis(engine.premiumBasis);
+        executionEngineState.entryThreshold = parseNumber(engine.entryThreshold, 0, -20, 40);
+        executionEngineState.exitThreshold = parseNumber(engine.exitThreshold, 0, -20, 40);
         executionEngineState.positionState = engine.positionState === 'ENTERED' ? 'ENTERED' : 'IDLE';
+        executionEngineState.positionSideMode = 'UNKNOWN';
         executionEngineState.pollIntervalMs = parsePositiveNumber(
             engine.pollIntervalMs,
             executionEnginePollIntervalMs,
@@ -1811,6 +1939,9 @@ function restoreExecutionEngineStateFromDisk() {
                     ? 'sell'
                     : null;
         executionEngineState.lastOrderId = normalizeExecutionOrderIdToken(engine.lastOrderId, 120);
+        executionEngineState.lastOrderAmount = Number.isFinite(toFiniteNumber(engine.lastOrderAmount))
+            ? Number(engine.lastOrderAmount)
+            : null;
         executionEngineState.lastPremium = Number.isFinite(toFiniteNumber(engine.lastPremium))
             ? Number(engine.lastPremium)
             : null;
@@ -1841,7 +1972,7 @@ function restoreExecutionEngineStateFromDisk() {
             symbol: executionEngineState.symbol,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
-            amount: round(executionEngineState.amount, 8),
+            orderBalancePct: round(executionEngineState.orderBalancePct, 4),
             entryThreshold: round(executionEngineState.entryThreshold, 6),
             exitThreshold: round(executionEngineState.exitThreshold, 6),
             positionState: executionEngineState.positionState,
@@ -1877,15 +2008,19 @@ function stopExecutionEngine(reason = 'manual-stop') {
             symbol: executionEngineState.symbol,
             dryRun: executionEngineState.dryRun,
         });
-        void sendDiscordNotification({
-            title: '⏹️ 자동매매 엔진 정지',
-            description: `사유: ${reason}`,
-            color: 0xf59e0b,
-            fields: [
-                { name: '심볼', value: executionEngineState.symbol },
-                { name: '마켓', value: executionEngineState.marketType },
-            ],
-        });
+        void (async () => {
+            const marketFields = await getDiscordMarketCoreFields();
+            void sendDiscordNotification({
+                title: '⏹️ 자동매매 엔진 정지',
+                description: `사유: ${reason}`,
+                color: 0xf59e0b,
+                fields: [
+                    { name: '심볼', value: executionEngineState.symbol },
+                    { name: '마켓', value: executionEngineState.marketType },
+                    ...marketFields,
+                ],
+            });
+        })();
     }
 }
 
@@ -1912,9 +2047,133 @@ async function fetchExecutionEngineMarketSnapshot() {
         usdPrice: round(usdPrice, 2),
         exchangeRate: round(exchangeRate, 4),
         usdtKrwRate: round(usdtKrwRate, 4),
+        usdtConversionRate: round(usdtConversionRate, 4),
         kimchiPremiumPercent: round(kimchiPremiumPercent, 6),
         kimchiPremiumPercentUsdt: round(kimchiPremiumPercentUsdt, 6),
     };
+}
+
+function buildDiscordMarketCoreFields(snapshot, options = {}) {
+    if (!snapshot || typeof snapshot !== 'object') return [];
+    const fields = [];
+    const premiumLabel = typeof options.premiumLabel === 'string' && options.premiumLabel.trim()
+        ? options.premiumLabel.trim()
+        : '김치프리미엄';
+    const premiumValue = toFiniteNumber(options.premiumValue);
+    const includePremium = options.includePremium !== false;
+    const includeUsdtPremium = options.includeUsdtPremium === true;
+    const syntheticRate = Number.isFinite(toFiniteNumber(snapshot.usdtConversionRate))
+        ? Number(snapshot.usdtConversionRate)
+        : Number.isFinite(toFiniteNumber(snapshot.usdtKrwRate)) && Number(snapshot.usdtKrwRate) > 0
+            ? Number(snapshot.usdtKrwRate)
+            : Number(snapshot.exchangeRate);
+
+    if (includePremium) {
+        const resolvedPremium = Number.isFinite(premiumValue)
+            ? Number(premiumValue)
+            : Number(snapshot.kimchiPremiumPercent);
+        if (Number.isFinite(resolvedPremium)) {
+            fields.push({ name: premiumLabel, value: `${round(resolvedPremium, 4)}%` });
+        }
+    }
+
+    if (includeUsdtPremium && Number.isFinite(toFiniteNumber(snapshot.kimchiPremiumPercentUsdt))) {
+        fields.push({ name: '김치프리미엄(USDT)', value: `${round(Number(snapshot.kimchiPremiumPercentUsdt), 4)}%` });
+    }
+
+    if (Number.isFinite(toFiniteNumber(snapshot.krwPrice))) {
+        fields.push({ name: '국내 비트코인', value: `₩${Math.round(Number(snapshot.krwPrice)).toLocaleString()}` });
+    }
+    if (Number.isFinite(toFiniteNumber(snapshot.usdPrice))) {
+        fields.push({ name: '해외 비트코인', value: `$${round(Number(snapshot.usdPrice), 2).toLocaleString()}` });
+    }
+    if (Number.isFinite(toFiniteNumber(snapshot.exchangeRate))) {
+        fields.push({ name: 'USD/KRW', value: `₩${round(Number(snapshot.exchangeRate), 4).toLocaleString()}` });
+    }
+    if (Number.isFinite(toFiniteNumber(snapshot.usdtKrwRate))) {
+        fields.push({ name: 'USDT/KRW', value: `₩${round(Number(snapshot.usdtKrwRate), 4).toLocaleString()}` });
+    }
+    if (Number.isFinite(toFiniteNumber(syntheticRate))) {
+        fields.push({ name: '합성환율', value: `₩${round(Number(syntheticRate), 4).toLocaleString()}` });
+    }
+    return fields;
+}
+
+async function getDiscordMarketCoreFields(options = {}) {
+    try {
+        const snapshot = await fetchExecutionEngineMarketSnapshot();
+        return buildDiscordMarketCoreFields(snapshot, options);
+    } catch {
+        return [];
+    }
+}
+
+function normalizePositionSideToken(value) {
+    if (typeof value !== 'string') return null;
+    const token = value.trim().toLowerCase();
+    if (token === 'long') return 'LONG';
+    if (token === 'short') return 'SHORT';
+    if (token === 'both') return 'BOTH';
+    return null;
+}
+
+function extractPositionSideToken(position) {
+    if (!position || typeof position !== 'object') return null;
+    return normalizePositionSideToken(
+        position.positionSide ?? position.side ?? position.info?.positionSide
+    );
+}
+
+function resolveShortPositionSnapshot(positions, symbol) {
+    if (!Array.isArray(positions)) {
+        return { shortContracts: 0, hedgeModeDetected: false, hadPositions: false };
+    }
+
+    let shortContracts = 0;
+    let hedgeModeDetected = false;
+    let hadPositions = false;
+
+    for (const pos of positions) {
+        if (!pos || typeof pos !== 'object') continue;
+        if (symbol && typeof pos.symbol === 'string' && pos.symbol !== symbol) continue;
+        hadPositions = true;
+
+        const sideToken = extractPositionSideToken(pos);
+        if (sideToken === 'LONG' || sideToken === 'SHORT') {
+            hedgeModeDetected = true;
+        }
+
+        const contracts = toFiniteNumber(pos.contracts);
+        const positionAmt = toFiniteNumber(pos.info?.positionAmt);
+        const quantity = Number.isFinite(contracts)
+            ? Math.abs(contracts)
+            : Number.isFinite(positionAmt)
+                ? Math.abs(positionAmt)
+                : 0;
+
+        if (quantity <= 0) continue;
+
+        let isShort = false;
+        if (sideToken === 'SHORT') {
+            isShort = true;
+        } else if (sideToken === 'LONG') {
+            isShort = false;
+        } else if (Number.isFinite(positionAmt)) {
+            isShort = positionAmt < 0;
+        } else {
+            continue;
+        }
+
+        if (isShort) shortContracts += quantity;
+    }
+
+    return { shortContracts, hedgeModeDetected, hadPositions };
+}
+
+function isPositionSideMismatchError(message) {
+    if (!message) return false;
+    const normalized = message.toLowerCase();
+    return normalized.includes('position side') || normalized.includes('positionside');
 }
 
 async function syncExecutionEnginePositionState() {
@@ -1924,73 +2183,100 @@ async function syncExecutionEnginePositionState() {
 
     const client = await getBinanceExecutionClient(executionEngineState.marketType, true);
     const positions = await client.fetchPositions([executionEngineState.symbol]);
-    const position = Array.isArray(positions) ? positions[0] : null;
-    const contracts = toFiniteNumber(position?.contracts);
-    const hasPosition = Number.isFinite(contracts) && Math.abs(contracts) > 1e-12;
+    const snapshot = resolveShortPositionSnapshot(positions, executionEngineState.symbol);
+    if (snapshot.hadPositions) {
+        executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
+    }
+    const hasPosition = snapshot.shortContracts > 1e-12;
 
     executionEngineState.positionState = hasPosition ? 'ENTERED' : 'IDLE';
     return executionEngineState.positionState;
 }
 
-async function placeExecutionEngineOrder(side, marketSnapshot, premiumValue) {
-    const idempotencyKey = `engine-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
+async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue) {
     const url = `http://127.0.0.1:${port}/api/execution/binance/order`;
-    const body = {
-        marketType: executionEngineState.marketType,
-        symbol: executionEngineState.symbol,
-        side,
-        type: 'market',
-        amount: executionEngineState.amount,
-        dryRun: executionEngineState.dryRun,
-        reduceOnly: side === 'buy',
-        positionSide: 'SHORT',
-        strategyContext: {
-            action: side === 'sell' ? 'ENTRY_SELL' : 'EXIT_BUY',
-            decisionTimestamp: marketSnapshot.timestamp,
-            premiumPct: marketSnapshot.kimchiPremiumPercent,
-            effectivePremiumPct: premiumValue,
-            usdtKrwRate: marketSnapshot.usdtKrwRate,
-            exchangeRate: marketSnapshot.exchangeRate,
-            usdPrice: marketSnapshot.usdPrice,
-            krwPrice: marketSnapshot.krwPrice,
-        },
+
+    const requestExecutionOrder = async (positionSide) => {
+        const idempotencyKey = `engine-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
+        const body = {
+            marketType: executionEngineState.marketType,
+            symbol: executionEngineState.symbol,
+            side,
+            type: 'market',
+            amount: orderAmount,
+            dryRun: executionEngineState.dryRun,
+            reduceOnly: side === 'buy',
+            strategyContext: {
+                action: side === 'sell' ? 'ENTRY_SELL' : 'EXIT_BUY',
+                decisionTimestamp: marketSnapshot.timestamp,
+                premiumPct: marketSnapshot.kimchiPremiumPercent,
+                effectivePremiumPct: premiumValue,
+                usdtKrwRate: marketSnapshot.usdtKrwRate,
+                exchangeRate: marketSnapshot.exchangeRate,
+                usdPrice: marketSnapshot.usdPrice,
+                krwPrice: marketSnapshot.krwPrice,
+            },
+        };
+
+        if (positionSide) {
+            body.positionSide = positionSide;
+        }
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                'Idempotency-Key': idempotencyKey,
+                ...getExecutionEngineAuthHeaders(),
+            },
+            body: JSON.stringify(body),
+        });
+
+        let text = '';
+        try {
+            text = (await response.text()).trim();
+        } catch {
+            text = '';
+        }
+        let payload = null;
+        if (text) {
+            try {
+                payload = JSON.parse(text);
+            } catch {
+                payload = null;
+            }
+        }
+
+        if (!response.ok) {
+            const message =
+                (payload && typeof payload.error === 'string' && payload.error) ||
+                text ||
+                `HTTP ${response.status}`;
+            throw new Error(message);
+        }
+
+        return payload;
     };
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-            'Idempotency-Key': idempotencyKey,
-            ...getExecutionEngineAuthHeaders(),
-        },
-        body: JSON.stringify(body),
-    });
+    const preferredPositionSide = executionEngineState.positionSideMode === 'HEDGE' ? 'SHORT' : null;
 
-    let text = '';
     try {
-        text = (await response.text()).trim();
-    } catch {
-        text = '';
-    }
-    let payload = null;
-    if (text) {
-        try {
-            payload = JSON.parse(text);
-        } catch {
-            payload = null;
+        const payload = await requestExecutionOrder(preferredPositionSide);
+        executionEngineState.positionSideMode = preferredPositionSide ? 'HEDGE' : 'ONEWAY';
+        return payload;
+    } catch (error) {
+        const message = toErrorMessage(error);
+        if (isPositionSideMismatchError(message)) {
+            const fallbackPositionSide = preferredPositionSide ? null : 'SHORT';
+            if (fallbackPositionSide !== preferredPositionSide) {
+                const payload = await requestExecutionOrder(fallbackPositionSide);
+                executionEngineState.positionSideMode = fallbackPositionSide ? 'HEDGE' : 'ONEWAY';
+                return payload;
+            }
         }
+        throw error;
     }
-
-    if (!response.ok) {
-        const message =
-            (payload && typeof payload.error === 'string' && payload.error) ||
-            text ||
-            `HTTP ${response.status}`;
-        throw new Error(message);
-    }
-
-    return payload;
 }
 
 function scheduleExecutionEngineTick(delayMs = executionEngineState.pollIntervalMs) {
@@ -2025,6 +2311,7 @@ async function runExecutionEngineTick() {
                 ? marketSnapshot.kimchiPremiumPercentUsdt
                 : marketSnapshot.kimchiPremiumPercent;
 
+        const previousPremium = executionEngineState.lastPremium;
         executionEngineState.lastMarketDataTimestamp = marketSnapshot.timestamp;
         executionEngineState.lastPremium = round(premiumValue, 6);
         executionEngineState.lastEffectivePremium = round(
@@ -2033,43 +2320,60 @@ async function runExecutionEngineTick() {
         );
         executionEngineState.lastError = null;
 
-        // --- Premium threshold Discord alert ---
+        // --- Premium threshold Discord alert (multi-threshold) ---
         if (
             discordWebhookUrl &&
             discordNotificationSettings.premiumAlertEnabled &&
-            Number.isFinite(premiumValue)
+            Number.isFinite(premiumValue) &&
+            Number.isFinite(previousPremium) &&
+            Array.isArray(discordNotificationSettings.premiumAlertThresholds)
         ) {
             const now = Date.now();
-            const highThreshold = discordNotificationSettings.premiumAlertThresholdHigh;
-            const lowThreshold = discordNotificationSettings.premiumAlertThresholdLow;
-            let alertTitle = null;
-            let alertColor = 0;
+            for (const threshold of discordNotificationSettings.premiumAlertThresholds) {
+                if (!threshold || !Number.isFinite(threshold.value)) continue;
+                const tv = threshold.value;
+                const crossedAbove = previousPremium < tv && premiumValue >= tv;
+                const crossedBelow = previousPremium > tv && premiumValue <= tv;
 
-            if (Number.isFinite(highThreshold) && premiumValue >= highThreshold) {
-                alertTitle = `🔺 김프 상한 알림 (${round(premiumValue, 2)}% ≥ ${round(highThreshold, 2)}%)`;
-                alertColor = 0xef4444;
-            } else if (Number.isFinite(lowThreshold) && premiumValue <= lowThreshold) {
-                alertTitle = `🔻 김프 하한 알림 (${round(premiumValue, 2)}% ≤ ${round(lowThreshold, 2)}%)`;
-                alertColor = 0x3b82f6;
-            }
+                // Notify only on upward crossing of threshold.
+                const aboveKey = `${threshold.id}:above`;
+                if (crossedAbove && now - (lastPremiumAlertAtMap[aboveKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
+                    lastPremiumAlertAtMap[aboveKey] = now;
+                    const savedCooldown = lastDiscordNotificationAt;
+                    lastDiscordNotificationAt = 0;
+                    const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
+                        premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
+                        premiumValue,
+                        includePremium: true,
+                        includeUsdtPremium: true,
+                    });
+                    void sendDiscordNotification({
+                        title: `🔺 김프 ${round(tv, 2)}% 이상 (${round(premiumValue, 2)}%)`,
+                        description: `김프가 ${round(tv, 2)}%를 돌파했습니다.`,
+                        color: 0xef4444,
+                        fields: marketFields,
+                    }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+                }
 
-            if (alertTitle && now - lastPremiumAlertAt >= PREMIUM_ALERT_COOLDOWN_MS) {
-                lastPremiumAlertAt = now;
-                const savedCooldown = lastDiscordNotificationAt;
-                lastDiscordNotificationAt = 0;
-                void sendDiscordNotification({
-                    title: alertTitle,
-                    description: '설정한 김프 임계값을 돌파했습니다.',
-                    color: alertColor,
-                    fields: [
-                        { name: '현재 김프 (USD)', value: `${round(premiumValue, 4)}%` },
-                        { name: '김프 (USDT)', value: `${round(marketSnapshot.kimchiPremiumPercentUsdt, 4)}%` },
-                        { name: 'BTC/KRW', value: `₩${Math.round(marketSnapshot.krwPrice).toLocaleString()}` },
-                        { name: 'BTC/USD', value: `$${round(marketSnapshot.usdPrice, 2).toLocaleString()}` },
-                        { name: '상한 임계', value: `${round(highThreshold, 2)}%` },
-                        { name: '하한 임계', value: `${round(lowThreshold, 2)}%` },
-                    ],
-                }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+                // Notify only on downward crossing of threshold.
+                const belowKey = `${threshold.id}:below`;
+                if (crossedBelow && now - (lastPremiumAlertAtMap[belowKey] || 0) >= PREMIUM_ALERT_COOLDOWN_MS) {
+                    lastPremiumAlertAtMap[belowKey] = now;
+                    const savedCooldown = lastDiscordNotificationAt;
+                    lastDiscordNotificationAt = 0;
+                    const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
+                        premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
+                        premiumValue,
+                        includePremium: true,
+                        includeUsdtPremium: true,
+                    });
+                    void sendDiscordNotification({
+                        title: `🔻 김프 ${round(tv, 2)}% 이하 (${round(premiumValue, 2)}%)`,
+                        description: `김프가 ${round(tv, 2)}% 이하로 내려갔습니다.`,
+                        color: 0x3b82f6,
+                        fields: marketFields,
+                    }).then(() => { lastDiscordNotificationAt = savedCooldown; });
+                }
             }
         }
 
@@ -2084,57 +2388,174 @@ async function runExecutionEngineTick() {
             return;
         }
 
-        let side = null;
-        if (
-            executionEngineState.positionState === 'IDLE' &&
-            premiumValue >= executionEngineState.entryThreshold
-        ) {
-            side = 'sell';
-        } else if (
-            executionEngineState.positionState === 'ENTERED' &&
-            premiumValue <= executionEngineState.exitThreshold
-        ) {
-            side = 'buy';
+        // --- Simple Threshold Strategy execution ---
+        const entryThreshold = executionEngineState.entryThreshold;
+        const exitThreshold = executionEngineState.exitThreshold;
+        const positionState = executionEngineState.positionState;
+
+        let action = null;
+        if (positionState === 'IDLE' && premiumValue >= entryThreshold) {
+            action = 'ENTRY';
+        } else if (positionState === 'ENTERED' && premiumValue <= exitThreshold) {
+            action = 'EXIT';
         }
 
-        if (!side) return;
+        if (!action) return;
+
+        const side = action === 'ENTRY' ? 'sell' : 'buy';
+        let orderAmount = 0;
+
+        try {
+            const rawPct = executionEngineState.orderBalancePct;
+            const pctFactor =
+                Number.isFinite(rawPct) && rawPct > 0
+                    ? Math.min(100, rawPct) / 100
+                    : NaN;
+
+            if (!Number.isFinite(pctFactor) || pctFactor <= 0) {
+                throw new Error(`order balance pct is invalid: ${rawPct}`);
+            }
+
+            const computeEntryAmount = async (client, freeBalance) => {
+                if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
+                    throw new Error('free balance is not available');
+                }
+
+                const price = toFiniteNumber(marketSnapshot.usdPrice);
+                if (!Number.isFinite(price) || price <= 0) {
+                    throw new Error('BTC price is not available');
+                }
+
+                if (executionEngineState.marketType === 'usdm') {
+                    return round((freeBalance * pctFactor) / price, 8);
+                }
+
+                const market = client && typeof client.market === 'function'
+                    ? client.market(executionEngineState.symbol)
+                    : null;
+                const contractSize = toFiniteNumber(market?.contractSize);
+                if (market?.inverse && Number.isFinite(contractSize) && contractSize > 0) {
+                    const notionalUsd = freeBalance * pctFactor * price;
+                    return round(notionalUsd / contractSize, 8);
+                }
+
+                return round(freeBalance * pctFactor, 8);
+            };
+
+            if (!executionEngineState.dryRun) {
+                const client = await getBinanceExecutionClient(executionEngineState.marketType, true);
+
+                if (action === 'ENTRY') {
+                    const balance = await client.fetchBalance();
+                    const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
+                    const freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
+                    if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
+                        throw new Error(`Insufficient ${balanceAsset} balance (${freeBalance})`);
+                    }
+                    orderAmount = await computeEntryAmount(client, freeBalance);
+                } else {
+                    const positions = await client.fetchPositions([executionEngineState.symbol]);
+                    const snapshot = resolveShortPositionSnapshot(positions, executionEngineState.symbol);
+                    if (snapshot.hadPositions) {
+                        executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
+                    }
+                    if (snapshot.shortContracts <= 0) {
+                        throw new Error(`No short position to close for ${executionEngineState.symbol}`);
+                    }
+                    orderAmount = round(snapshot.shortContracts * pctFactor, 8);
+                }
+            } else {
+                let client = null;
+                let freeBalance = NaN;
+                if (hasBinanceExecutionCredentials()) {
+                    try {
+                        client = await getBinanceExecutionClient(executionEngineState.marketType, true);
+                        const balance = await client.fetchBalance();
+                        const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
+                        freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
+                    } catch {
+                        client = null;
+                        freeBalance = NaN;
+                    }
+                }
+
+                if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
+                    freeBalance = executionEngineState.marketType === 'usdm' ? 1000 : 1;
+                }
+
+                if (action === 'ENTRY') {
+                    orderAmount = await computeEntryAmount(client, freeBalance);
+                } else if (
+                    executionEngineState.lastOrderSide === 'sell' &&
+                    Number.isFinite(executionEngineState.lastOrderAmount)
+                ) {
+                    orderAmount = round(executionEngineState.lastOrderAmount * pctFactor, 8);
+                } else {
+                    orderAmount = await computeEntryAmount(client, freeBalance);
+                }
+            }
+
+            if (!Number.isFinite(orderAmount) || orderAmount <= 0) {
+                throw new Error(`Calculated order amount is invalid: ${orderAmount}`);
+            }
+        } catch (calcError) {
+            const msg = toErrorMessage(calcError);
+            executionEngineState.lastError = msg;
+            recordRuntimeEvent('warn', 'execution_engine_amount_calc_failed', {
+                action,
+                error: msg,
+            });
+            return;
+        }
 
         executionEngineState.lastDecisionAt = Date.now();
-        const payload = await placeExecutionEngineOrder(side, marketSnapshot, premiumValue);
+        const payload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
         executionEngineState.lastOrderAt = Date.now();
         executionEngineState.lastOrderSide = side;
         executionEngineState.lastOrderId = normalizeExecutionOrderIdToken(payload?.order?.id, 120);
+        executionEngineState.lastOrderAmount = orderAmount;
         executionEngineState.lastOrderError = null;
-        executionEngineState.positionState = side === 'sell' ? 'ENTERED' : 'IDLE';
-        persistExecutionEngineState('order-triggered');
 
-        recordRuntimeEvent('info', 'execution_engine_order_triggered', {
+        // Update position state
+        executionEngineState.positionState = action === 'ENTRY' ? 'ENTERED' : 'IDLE';
+
+        persistExecutionEngineState('threshold-triggered');
+
+        recordRuntimeEvent('info', 'execution_engine_threshold_triggered', {
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
             side,
+            action,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
             premiumValue: round(premiumValue, 6),
-            entryThreshold: round(executionEngineState.entryThreshold, 6),
-            exitThreshold: round(executionEngineState.exitThreshold, 6),
+            entryThreshold: round(entryThreshold, 4),
+            exitThreshold: round(exitThreshold, 4),
+            orderAmount: round(orderAmount, 8),
             orderId: executionEngineState.lastOrderId,
         });
+
+        const marketFields = buildDiscordMarketCoreFields(marketSnapshot, {
+            includePremium: false,
+            includeUsdtPremium: false,
+        });
         void sendDiscordNotification({
-            title: side === 'sell' ? '🔴 판매 체결 (ENTRY)' : '🟢 매수 체결 (EXIT)',
-            description: `${executionEngineState.symbol} ${side.toUpperCase()} 주문 실행`,
-            color: side === 'sell' ? 0xef4444 : 0x10b981,
+            title: action === 'ENTRY' ? '🔴 숏 진입 (ENTRY)' : '🟢 포지션 청산 (EXIT)',
+            description: `${executionEngineState.symbol} ${side.toUpperCase()} · 김프 ${round(premiumValue, 2)}% 도달 (기준: ${action === 'ENTRY' ? entryThreshold : exitThreshold}%)`,
+            color: action === 'ENTRY' ? 0xef4444 : 0x10b981,
             fields: [
                 { name: '김프', value: `${round(premiumValue, 4)}%` },
-                { name: '수량', value: `${executionEngineState.amount}` },
-                { name: '판매 임계', value: `${round(executionEngineState.entryThreshold, 2)}%` },
-                { name: '매수 임계', value: `${round(executionEngineState.exitThreshold, 2)}%` },
+                { name: '기준가', value: `${action === 'ENTRY' ? entryThreshold : exitThreshold}%` },
+                { name: '주문수량', value: `${round(orderAmount, 8)}` },
                 { name: 'DryRun', value: executionEngineState.dryRun ? '✅ 시뮬' : '❌ 실매매' },
                 { name: 'Order ID', value: executionEngineState.lastOrderId ?? 'N/A', inline: false },
+                ...marketFields,
             ],
         });
 
         if (!executionEngineState.dryRun) {
             await syncExecutionEnginePositionState();
+            persistExecutionEngineState('position-synced');
         }
     } catch (error) {
         const message = toErrorMessage(error);
@@ -2158,7 +2579,7 @@ async function runExecutionEngineTick() {
 async function startExecutionEngine({
     marketType,
     symbol,
-    amount,
+    orderBalancePct,
     dryRun,
     premiumBasis,
     entryThreshold,
@@ -2183,16 +2604,31 @@ async function startExecutionEngine({
         }
     }
 
+    const resolvedOrderBalancePct = parseNumber(orderBalancePct, NaN, 0.0001, 100);
+    if (!Number.isFinite(resolvedOrderBalancePct) || resolvedOrderBalancePct <= 0 || resolvedOrderBalancePct > 100) {
+        throw new Error('orderBalancePct must be between 0 and 100');
+    }
+
+    const resolvedEntryThreshold = parseNumber(entryThreshold, NaN, -20, 40);
+    const resolvedExitThreshold = parseNumber(exitThreshold, NaN, -20, 40);
+    if (!Number.isFinite(resolvedEntryThreshold) || !Number.isFinite(resolvedExitThreshold)) {
+        throw new Error('entryThreshold and exitThreshold are required');
+    }
+    if (resolvedEntryThreshold <= resolvedExitThreshold) {
+        throw new Error('entryThreshold must be greater than exitThreshold');
+    }
+
     executionEngineState.marketType = normalizeExecutionMarketType(marketType);
     executionEngineState.symbol = parseExecutionSymbol(symbol, executionEngineState.marketType);
-    executionEngineState.amount = amount;
+    executionEngineState.orderBalancePct = resolvedOrderBalancePct;
     executionEngineState.dryRun = resolvedDryRun;
     executionEngineState.premiumBasis = premiumBasis === 'USDT' ? 'USDT' : 'USD';
-    executionEngineState.entryThreshold = entryThreshold;
-    executionEngineState.exitThreshold = exitThreshold;
+    executionEngineState.entryThreshold = resolvedEntryThreshold;
+    executionEngineState.exitThreshold = resolvedExitThreshold;
     executionEngineState.running = true;
     executionEngineState.busy = false;
     executionEngineState.positionState = 'IDLE';
+    executionEngineState.positionSideMode = 'UNKNOWN';
     executionEngineState.startedAt = Date.now();
     executionEngineState.stoppedAt = null;
     executionEngineState.lastTickAt = null;
@@ -2200,6 +2636,7 @@ async function startExecutionEngine({
     executionEngineState.lastOrderAt = null;
     executionEngineState.lastOrderSide = null;
     executionEngineState.lastOrderId = null;
+    executionEngineState.lastOrderAmount = null;
     executionEngineState.lastPremium = null;
     executionEngineState.lastEffectivePremium = null;
     executionEngineState.lastMarketDataTimestamp = null;
@@ -2230,23 +2667,22 @@ async function startExecutionEngine({
     recordRuntimeEvent('info', 'execution_engine_started', {
         marketType: executionEngineState.marketType,
         symbol: executionEngineState.symbol,
-        amount: round(executionEngineState.amount, 8),
         dryRun: executionEngineState.dryRun,
         premiumBasis: executionEngineState.premiumBasis,
-        entryThreshold: round(executionEngineState.entryThreshold, 6),
-        exitThreshold: round(executionEngineState.exitThreshold, 6),
+        entryThreshold: executionEngineState.entryThreshold,
+        exitThreshold: executionEngineState.exitThreshold,
         positionState: executionEngineState.positionState,
     });
     persistExecutionEngineState('start-ready');
+    const startMarketFields = await getDiscordMarketCoreFields();
     void sendDiscordNotification({
         title: '▶️ 자동매매 엔진 시작',
-        description: `${executionEngineState.symbol} 모니터링 시작`,
+        description: `${executionEngineState.symbol} 김프 모니터링 시작 (진입: ${executionEngineState.entryThreshold}%, 청산: ${executionEngineState.exitThreshold}%)`,
         color: 0x3b82f6,
         fields: [
             { name: '마켓', value: executionEngineState.marketType },
-            { name: '수량', value: `${round(executionEngineState.amount, 8)}` },
-            { name: '판매/매수', value: `${round(executionEngineState.entryThreshold, 2)}% / ${round(executionEngineState.exitThreshold, 2)}%` },
             { name: 'DryRun', value: executionEngineState.dryRun ? '✅' : '❌' },
+            ...startMarketFields,
         ],
     });
 
@@ -2308,6 +2744,36 @@ async function getBinanceExecutionClient(marketType, requireCredentials = true) 
 
     binanceExecutionClient = client;
     binanceExecutionClientCacheKey = cacheKey;
+    return client;
+}
+
+async function getBithumbExecutionClient(requireCredentials = true) {
+    const activeCredentials = getActiveBithumbExecutionCredentials();
+    const hasCredentials = activeCredentials.configured;
+
+    if (requireCredentials && !hasCredentials) {
+        throw new Error('BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured');
+    }
+
+    const credentialToken = hasCredentials
+        ? `${activeCredentials.source}:${activeCredentials.keyHint ?? 'unknown'}`
+        : 'none';
+    const cacheKey = `bithumb:${hasCredentials ? 'auth' : 'public'}:${credentialToken}`;
+
+    if (bithumbClient && bithumbClientCacheKey === cacheKey) {
+        return bithumbClient;
+    }
+
+    const client = new ccxt.bithumb({
+        apiKey: hasCredentials ? activeCredentials.apiKey : undefined,
+        secret: hasCredentials ? activeCredentials.apiSecret : undefined,
+        enableRateLimit: true,
+    });
+
+    await client.loadMarkets();
+
+    bithumbClient = client;
+    bithumbClientCacheKey = cacheKey;
     return client;
 }
 
@@ -4692,6 +5158,7 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.use('/api/execution', requireExecutionAdminAuth);
+app.use('/api/discord', requireExecutionAdminAuth);
 
 app.get('/api/execution/credentials/status', (req, res) => {
     res.json({
@@ -4704,11 +5171,16 @@ app.post('/api/execution/credentials', (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const apiKey = parseOptionalString(body.apiKey, 256);
     const apiSecret = parseOptionalString(body.apiSecret, 256);
+    const bithumbApiKey = parseOptionalString(body.bithumbApiKey, 256);
+    const bithumbApiSecret = parseOptionalString(body.bithumbApiSecret, 256);
     const persist = parseBoolean(body.persist, true);
 
-    if (!apiKey || !apiSecret) {
+    const hasNewBinance = !!(apiKey && apiSecret);
+    const hasNewBithumb = !!(bithumbApiKey && bithumbApiSecret);
+
+    if (!hasNewBinance && !hasNewBithumb) {
         res.status(400).json({
-            error: 'apiKey/apiSecret is required',
+            error: 'apiKey/apiSecret or bithumbApiKey/bithumbApiSecret is required',
             timestamp: Date.now(),
             credentials: getExecutionCredentialsStatusSummary(),
         });
@@ -4729,6 +5201,8 @@ app.post('/api/execution/credentials', (req, res) => {
         setRuntimeExecutionCredentials({
             apiKey,
             apiSecret,
+            bithumbApiKey,
+            bithumbApiSecret,
             persist,
             reason: 'api-set',
         });
@@ -4776,8 +5250,25 @@ try {
         if (saved.notifications && typeof saved.notifications === 'object') {
             const n = saved.notifications;
             if (typeof n.premiumAlertEnabled === 'boolean') discordNotificationSettings.premiumAlertEnabled = n.premiumAlertEnabled;
-            if (Number.isFinite(Number(n.premiumAlertThresholdHigh))) discordNotificationSettings.premiumAlertThresholdHigh = Number(n.premiumAlertThresholdHigh);
-            if (Number.isFinite(Number(n.premiumAlertThresholdLow))) discordNotificationSettings.premiumAlertThresholdLow = Number(n.premiumAlertThresholdLow);
+            // Migration: legacy high/low → thresholds array
+            if (Array.isArray(n.premiumAlertThresholds)) {
+                discordNotificationSettings.premiumAlertThresholds = n.premiumAlertThresholds
+                    .filter(t => t && Number.isFinite(Number(t.value)))
+                    .slice(0, 10)
+                    .map(t => ({
+                        id: typeof t.id === 'string' && t.id ? t.id : `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                        value: Number(t.value),
+                    }));
+            } else if (Number.isFinite(Number(n.premiumAlertThresholdHigh)) || Number.isFinite(Number(n.premiumAlertThresholdLow))) {
+                const migrated = [];
+                if (Number.isFinite(Number(n.premiumAlertThresholdHigh))) {
+                    migrated.push({ id: 'default-high', value: Number(n.premiumAlertThresholdHigh) });
+                }
+                if (Number.isFinite(Number(n.premiumAlertThresholdLow))) {
+                    migrated.push({ id: 'default-low', value: Number(n.premiumAlertThresholdLow) });
+                }
+                discordNotificationSettings.premiumAlertThresholds = migrated;
+            }
             if (typeof n.periodicReportEnabled === 'boolean') discordNotificationSettings.periodicReportEnabled = n.periodicReportEnabled;
             if (Number.isFinite(Number(n.reportIntervalMinutes)) && Number(n.reportIntervalMinutes) >= 10) discordNotificationSettings.reportIntervalMinutes = Number(n.reportIntervalMinutes);
         }
@@ -4789,8 +5280,7 @@ try {
 function getDiscordNotificationSettingsSummary() {
     return {
         premiumAlertEnabled: discordNotificationSettings.premiumAlertEnabled,
-        premiumAlertThresholdHigh: discordNotificationSettings.premiumAlertThresholdHigh,
-        premiumAlertThresholdLow: discordNotificationSettings.premiumAlertThresholdLow,
+        premiumAlertThresholds: discordNotificationSettings.premiumAlertThresholds,
         periodicReportEnabled: discordNotificationSettings.periodicReportEnabled,
         reportIntervalMinutes: discordNotificationSettings.reportIntervalMinutes,
     };
@@ -4826,10 +5316,14 @@ function restartDiscordPeriodicReportTimer() {
 
         try {
             const snapshot = await fetchExecutionEngineMarketSnapshot();
-            const premium = round(snapshot.kimchiPremiumPercent, 4);
-            const premiumUsdt = round(snapshot.kimchiPremiumPercentUsdt, 4);
             const running = executionEngineState.running;
             const posState = executionEngineState.positionState;
+            const marketFields = buildDiscordMarketCoreFields(snapshot, {
+                premiumLabel: '김치프리미엄(USD)',
+                premiumValue: snapshot.kimchiPremiumPercent,
+                includePremium: true,
+                includeUsdtPremium: true,
+            });
 
             // 정기 보고는 쿨다운 무시
             lastDiscordNotificationAt = 0;
@@ -4838,11 +5332,7 @@ function restartDiscordPeriodicReportTimer() {
                 description: '현재 BTC 김치프리미엄 현황',
                 color: 0x6366f1,
                 fields: [
-                    { name: '김프 (USD)', value: `${premium}%` },
-                    { name: '김프 (USDT)', value: `${premiumUsdt}%` },
-                    { name: 'BTC/KRW', value: `₩${Math.round(snapshot.krwPrice).toLocaleString()}` },
-                    { name: 'BTC/USD', value: `$${round(snapshot.usdPrice, 2).toLocaleString()}` },
-                    { name: 'USD/KRW', value: `₩${round(snapshot.exchangeRate, 2)}` },
+                    ...marketFields,
                     { name: '엔진', value: running ? `🟢 ${posState}` : '⏹️ 정지' },
                 ],
             });
@@ -4880,8 +5370,15 @@ app.post('/api/discord/config', express.json(), (req, res) => {
     if (body.notifications && typeof body.notifications === 'object') {
         const n = body.notifications;
         if (typeof n.premiumAlertEnabled === 'boolean') discordNotificationSettings.premiumAlertEnabled = n.premiumAlertEnabled;
-        if (Number.isFinite(Number(n.premiumAlertThresholdHigh))) discordNotificationSettings.premiumAlertThresholdHigh = Number(n.premiumAlertThresholdHigh);
-        if (Number.isFinite(Number(n.premiumAlertThresholdLow))) discordNotificationSettings.premiumAlertThresholdLow = Number(n.premiumAlertThresholdLow);
+        if (Array.isArray(n.premiumAlertThresholds)) {
+            discordNotificationSettings.premiumAlertThresholds = n.premiumAlertThresholds
+                .filter(t => t && Number.isFinite(Number(t.value)))
+                .slice(0, 10)
+                .map(t => ({
+                    id: typeof t.id === 'string' && t.id ? t.id : `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                    value: Number(t.value),
+                }));
+        }
         if (typeof n.periodicReportEnabled === 'boolean') discordNotificationSettings.periodicReportEnabled = n.periodicReportEnabled;
         if (Number.isFinite(Number(n.reportIntervalMinutes)) && Number(n.reportIntervalMinutes) >= 10) {
             discordNotificationSettings.reportIntervalMinutes = Number(n.reportIntervalMinutes);
@@ -4907,14 +5404,21 @@ app.post('/api/discord/test', async (req, res) => {
 
     try {
         lastDiscordNotificationAt = 0;
-        await sendDiscordNotification({
+        const marketFields = await getDiscordMarketCoreFields();
+        const result = await sendDiscordNotification({
             title: '✅ 테스트 알림',
             description: '디스코드 웹훅이 정상적으로 연결되었습니다!',
             color: 0x10b981,
             fields: [
                 { name: '시간', value: new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }), inline: false },
+                ...marketFields,
             ],
         });
+        if (!result?.ok) {
+            return res.status(502).json({
+                error: `Failed to send test: ${result?.error ?? 'unknown error'}`,
+            });
+        }
         res.json({ success: true, message: 'Test notification sent' });
     } catch (error) {
         res.status(500).json({ error: `Failed to send test: ${toErrorMessage(error)}` });
@@ -5081,6 +5585,19 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
             executionEngineState.entryThreshold > executionEngineState.exitThreshold
                 ? 'engine thresholds are valid'
                 : 'engine entryThreshold must be greater than exitThreshold',
+    });
+
+    const orderBalancePctOk =
+        Number.isFinite(executionEngineState.orderBalancePct) &&
+        executionEngineState.orderBalancePct > 0 &&
+        executionEngineState.orderBalancePct <= 100;
+    checks.push({
+        key: 'engine_order_balance_pct_valid',
+        ok: orderBalancePctOk,
+        severity: 'error',
+        message: orderBalancePctOk
+            ? 'engine order balance pct is configured'
+            : 'engine order balance pct must be between 0 and 100',
     });
 
     let connectivityOk = false;
@@ -5442,19 +5959,24 @@ app.post('/api/execution/engine/start', async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const marketType = normalizeExecutionMarketType(body.marketType);
     const symbol = parseExecutionSymbol(body.symbol, marketType);
-    const amount = toFiniteNumber(body.amount);
     const dryRun = parseBoolean(body.dryRun, true);
     const premiumBasis = normalizePremiumBasis(body.premiumBasis);
-    const entryThreshold = parseNumber(body.entryThreshold, 2.0, -20, 40);
-    const exitThreshold = parseNumber(body.exitThreshold, 0.0, -20, 40);
+    const entryThreshold = toFiniteNumber(body.entryThreshold);
+    const exitThreshold = toFiniteNumber(body.exitThreshold);
+    const orderBalancePct = toFiniteNumber(body.orderBalancePct ?? body.amount);
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-        res.status(400).json({ error: 'amount must be a positive number' });
+    if (!Number.isFinite(entryThreshold) || !Number.isFinite(exitThreshold)) {
+        res.status(400).json({ error: 'entryThreshold and exitThreshold are required' });
         return;
     }
 
     if (entryThreshold <= exitThreshold) {
         res.status(400).json({ error: 'entryThreshold must be greater than exitThreshold' });
+        return;
+    }
+
+    if (!Number.isFinite(orderBalancePct) || orderBalancePct <= 0 || orderBalancePct > 100) {
+        res.status(400).json({ error: 'orderBalancePct must be between 0 and 100' });
         return;
     }
 
@@ -5532,9 +6054,9 @@ app.post('/api/execution/engine/start', async (req, res) => {
         await startExecutionEngine({
             marketType,
             symbol,
-            amount,
             dryRun,
             premiumBasis,
+            orderBalancePct,
             entryThreshold,
             exitThreshold,
         });
@@ -6011,6 +6533,352 @@ app.get('/api/backtest/premium/history', async (req, res) => {
     }
 });
 
+app.get('/api/execution/bithumb/portfolio', async (req, res) => {
+    const startedAt = Date.now();
+    const symbol = parseExecutionSymbol(req.query.symbol, 'coinm');
+    const balanceLimit = Math.floor(parseNumber(req.query.balanceLimit, 8, 1, 30));
+    const hasCredentials = hasBithumbExecutionCredentials();
+
+    const balanceAsset = 'KRW';
+
+    if (!hasCredentials) {
+        res.status(200).json({
+            timestamp: Date.now(),
+            connected: false,
+            configured: false,
+            marketType: 'spot',
+            symbol,
+            testnet: false,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances: [],
+            positions: [],
+            summary: {
+                walletAssetFree: null,
+                walletAssetUsed: null,
+                walletAssetTotal: null,
+                walletBalanceCount: 0,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+            error: 'BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured',
+        });
+        recordRuntimeEvent('warn', 'api_execution_bithumb_portfolio_not_configured', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+        });
+        return;
+    }
+
+    try {
+        const client = await getBithumbExecutionClient(true);
+        const balance = await client.fetchBalance();
+
+        const walletBalances = normalizeExecutionWalletBalances(balance, balanceLimit);
+        const positions = []; // Spot market doesn't have positions in CCXT standard way
+        const assetBalance = balance?.[balanceAsset] ?? {};
+
+        const payload = {
+            timestamp: Date.now(),
+            connected: true,
+            configured: true,
+            marketType: 'spot',
+            symbol,
+            testnet: false,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances,
+            positions,
+            summary: {
+                walletAssetFree: toNullableRounded(assetBalance?.free, 8),
+                walletAssetUsed: toNullableRounded(assetBalance?.used, 8),
+                walletAssetTotal: toNullableRounded(assetBalance?.total, 8),
+                walletBalanceCount: walletBalances.length,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+        };
+
+        res.json(payload);
+        recordRuntimeEvent('info', 'api_execution_bithumb_portfolio_success', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            walletBalanceCount: walletBalances.length,
+        });
+    } catch (error) {
+        const message = toErrorMessage(error);
+        recordRuntimeEvent('error', 'api_execution_bithumb_portfolio_failure', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            error: message,
+        });
+        res.status(500).json({
+            timestamp: Date.now(),
+            connected: false,
+            configured: true,
+            marketType: 'spot',
+            symbol,
+            testnet: false,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances: [],
+            positions: [],
+            summary: {
+                walletAssetFree: null,
+                walletAssetUsed: null,
+                walletAssetTotal: null,
+                walletBalanceCount: 0,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+            error: `Failed to fetch Bithumb portfolio: ${message}`,
+        });
+    }
+});
+
+app.post('/api/execution/bithumb/order', async (req, res) => {
+    const startedAt = Date.now();
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const symbol = parseExecutionSymbol(body.symbol, 'coinm'); // Bithumb typically uses BTC/KRW format in ccxt
+    const side = parseExecutionOrderSide(body.side);
+    const type = parseExecutionOrderType(body.type ?? 'market');
+    const amount = toFiniteNumber(body.amount);
+    const rawPrice = toFiniteNumber(body.price);
+    const dryRun = parseBoolean(body.dryRun, false);
+    const allowInSafeMode = parseBoolean(body.allowInSafeMode, false);
+    const strategyContextRaw = parseExecutionStrategyContext(body.strategyContext);
+    const strategyContext = strategyContextRaw
+        ? {
+            ...strategyContextRaw,
+            action:
+                strategyContextRaw.action ??
+                (side === 'sell' ? 'ENTRY_SELL' : side === 'buy' ? 'EXIT_BUY' : null),
+        }
+        : null;
+    const retries = Math.floor(parseNumber(body.retries, executionOrderRetryCount, 0, 5));
+    const retryDelayMs = Math.floor(parseNumber(body.retryDelayMs, executionOrderRetryDelayMs, 100, 10_000));
+    const idempotencyKey = getExecutionIdempotencyKey(req);
+
+    if (!side || !type) {
+        res.status(400).json({ error: 'side must be buy|sell and type must be market|limit' });
+        return;
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        res.status(400).json({ error: 'amount must be a positive number' });
+        return;
+    }
+
+    if (type === 'limit' && (!Number.isFinite(rawPrice) || rawPrice <= 0)) {
+        res.status(400).json({ error: 'price must be a positive number for limit order' });
+        return;
+    }
+
+    if (!dryRun && !idempotencyKey) {
+        res.status(400).json({ error: 'Idempotency-Key header (or idempotencyKey body) is required for live order request' });
+        return;
+    }
+
+    if (executionFailureState.safeMode && !allowInSafeMode && !dryRun) {
+        res.status(423).json({
+            timestamp: Date.now(),
+            marketType: 'spot',
+            symbol,
+            safety: getExecutionSafetySummary(),
+            error: 'Execution safe mode is active. Reset safety state first or set allowInSafeMode=true.',
+        });
+        return;
+    }
+
+    const orderFingerprint = generateExecutionOrderFingerprint({
+        exchange: 'bithumb',
+        symbol,
+        side,
+        type,
+        amount,
+        price: rawPrice,
+    });
+
+    if (!dryRun && checkExecutionIdempotency(idempotencyKey, orderFingerprint, res)) {
+        recordRuntimeEvent('info', 'api_execution_bithumb_order_idempotent_hit', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            side,
+            type,
+            amount,
+        });
+        return;
+    }
+
+    let price = rawPrice;
+    if (type === 'market') {
+        price = undefined; // ccxt market order takes undefined for price
+    }
+
+    const baseResponse = {
+        timestamp: Date.now(),
+        marketType: 'spot',
+        testnet: false,
+        exchange: 'bithumb',
+        request: {
+            symbol,
+            side,
+            type,
+            amount: round(amount, 8),
+            price: Number.isFinite(price) ? round(price, 8) : null,
+            dryRun,
+        },
+        retry: {
+            attempt: 1,
+            maxAttempts: retries + 1,
+        },
+        strategyContext,
+    };
+
+    if (dryRun) {
+        const payload = {
+            ...baseResponse,
+            order: {
+                id: `dry-run-${Date.now()}`,
+                status: 'simulated',
+                symbol,
+                type,
+                side,
+                amount: round(amount, 8),
+                price: Number.isFinite(price) ? round(price, 8) : null,
+                filled: 0,
+                remaining: round(amount, 8),
+                cost: 0,
+                average: null,
+                timestamp: Date.now(),
+                datetime: new Date().toISOString(),
+            },
+            safety: getExecutionSafetySummary(),
+        };
+
+        recordRuntimeEvent('info', 'api_execution_bithumb_order_dry_run', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            side,
+            type,
+            amount: round(amount, 8),
+            strategyContext,
+        });
+        completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
+        res.json(payload);
+        return;
+    }
+
+    const client = await getBithumbExecutionClient(true);
+
+    let order = null;
+    let attempt = 1;
+    for (attempt = 1; attempt <= retries + 1; attempt += 1) {
+        try {
+            order = await client.createOrder(
+                symbol,
+                type,
+                side,
+                amount,
+                Number.isFinite(price) ? price : undefined
+            );
+            break;
+        } catch (error) {
+            const isLastAttempt = attempt >= retries + 1;
+            const message = toErrorMessage(error);
+
+            recordRuntimeEvent('warn', 'api_execution_bithumb_order_attempt_failed', {
+                durationMs: Date.now() - startedAt,
+                symbol,
+                side,
+                type,
+                amount: round(amount, 8),
+                attempt,
+                maxAttempts: retries + 1,
+                error: message,
+            });
+
+            if (isLastAttempt) {
+                throw error;
+            }
+
+            await wait(retryDelayMs * attempt);
+        }
+    }
+
+    const payload = {
+        ...baseResponse,
+        retry: {
+            ...baseResponse.retry,
+            attempt,
+        },
+        order: {
+            id: order?.id ?? null,
+            clientOrderId: null, // Bithumb typically doesn't support clientOrderId
+            status: order?.status ?? null,
+            symbol: order?.symbol ?? symbol,
+            type: order?.type ?? type,
+            side: order?.side ?? side,
+            amount: order?.amount == null ? null : round(order.amount, 8),
+            price: order?.price == null ? null : round(order.price, 8),
+            filled: order?.filled == null ? null : round(order.filled, 8),
+            remaining: order?.remaining == null ? null : round(order.remaining, 8),
+            cost: order?.cost == null ? null : round(order.cost, 8),
+            average: order?.average == null ? null : round(order.average, 8),
+            timestamp: order?.timestamp == null ? null : Number(order.timestamp),
+            datetime: typeof order?.datetime === 'string' ? order.datetime : null,
+            fee: order?.fee
+                ? {
+                    currency: order.fee.currency ?? null,
+                    cost: order.fee.cost == null ? null : round(order.fee.cost, 8),
+                    rate: order.fee.rate == null ? null : round(order.fee.rate, 8),
+                }
+                : null,
+        },
+        safety: getExecutionSafetySummary(),
+    };
+
+    recordRuntimeEvent('info', 'api_execution_bithumb_order_success', {
+        durationMs: Date.now() - startedAt,
+        symbol,
+        side,
+        type,
+        amount: round(amount, 8),
+        orderId: payload.order.id,
+        status: payload.order.status,
+        attempt,
+        strategyContext,
+    });
+
+    if (payload.order.status === 'closed') {
+        const discordFields = [
+            { name: '거래소', value: '빗썸', inline: true },
+            { name: '심볼', value: payload.order.symbol, inline: true },
+            { name: '방향', value: payload.order.side === 'buy' ? '🟢 매수' : '🔴 매도', inline: true },
+            { name: '수량', value: `${payload.order.amount ?? amount}`, inline: true },
+            { name: '체결가', value: `${payload.order.average ?? payload.order.price ?? price ?? '시장가'}`, inline: true },
+            { name: '상태', value: '✅ 체결 완료', inline: true },
+        ];
+        if (strategyContext) {
+            discordFields.push({
+                name: '전략',
+                value: `${strategyContext.action === 'ENTRY_SELL' ? '🔴 진입' : '🟢 청산'} (김프: ${strategyContext.effectivePremiumPct ?? strategyContext.premiumPct}%)`,
+                inline: false
+            });
+        }
+        const marketFields = await getDiscordMarketCoreFields();
+        sendDiscordNotification({
+            title: payload.order.side === 'buy' ? '🟢 빗썸 매수 체결' : '🔴 빗썸 매도 체결',
+            description: '빗썸 거래소에서 현물 시장가 주문이 체결되었습니다.',
+            color: payload.order.side === 'buy' ? 0x10b981 : 0xf43f5e,
+            fields: [...discordFields, ...marketFields]
+        }).catch(() => {});
+    }
+
+    completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
+    res.json(payload);
+});
+
 app.get('/api/execution/events', (req, res) => {
     const limit = parseLimit(req.query.limit, 50, runtimeEventLimit);
     const onlyFailures = parseBoolean(req.query.onlyFailures, false);
@@ -6145,7 +7013,7 @@ app.listen(port, () => {
             symbol:
                 executionEngineAutoSymbol ||
                 defaultExecutionSymbolByMarketType(executionEngineAutoMarketType),
-            amount: executionEngineAutoAmount,
+            orderBalancePct: executionEngineAutoBalancePct,
             dryRun: executionEngineAutoDryRun,
             premiumBasis: executionEngineAutoPremiumBasis,
             entryThreshold: executionEngineAutoEntryThreshold,
@@ -6155,13 +7023,25 @@ app.listen(port, () => {
         : {
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
-            amount: executionEngineState.amount,
+            orderBalancePct: executionEngineState.orderBalancePct,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
             entryThreshold: executionEngineState.entryThreshold,
             exitThreshold: executionEngineState.exitThreshold,
             source: 'restored-state',
         };
+
+    if (
+        !Number.isFinite(autoStartConfig.orderBalancePct) ||
+        autoStartConfig.orderBalancePct <= 0 ||
+        autoStartConfig.orderBalancePct > 100
+    ) {
+        recordRuntimeEvent('error', 'execution_engine_autostart_invalid_order_balance_pct', {
+            source: autoStartConfig.source,
+            orderBalancePct: autoStartConfig.orderBalancePct,
+        });
+        return;
+    }
 
     if (autoStartConfig.entryThreshold <= autoStartConfig.exitThreshold) {
         recordRuntimeEvent('error', 'execution_engine_autostart_invalid_threshold', {
@@ -6182,7 +7062,7 @@ app.listen(port, () => {
                 symbol: autoStartConfig.symbol,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
-                amount: round(autoStartConfig.amount, 8),
+                orderBalancePct: round(autoStartConfig.orderBalancePct, 4),
                 entryThreshold: round(autoStartConfig.entryThreshold, 6),
                 exitThreshold: round(autoStartConfig.exitThreshold, 6),
             });
@@ -6193,7 +7073,7 @@ app.listen(port, () => {
                 symbol: autoStartConfig.symbol,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
-                amount: round(autoStartConfig.amount, 8),
+                orderBalancePct: round(autoStartConfig.orderBalancePct, 4),
                 entryThreshold: round(autoStartConfig.entryThreshold, 6),
                 exitThreshold: round(autoStartConfig.exitThreshold, 6),
                 error: toErrorMessage(error),

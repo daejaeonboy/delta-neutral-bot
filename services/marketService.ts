@@ -1,5 +1,6 @@
 import {
     AuthSessionResponse,
+    BithumbExecutionPortfolioResponse,
     BinanceExecutionFillsResponse,
     BinanceExecutionPortfolioResponse,
     BinanceExecutionPositionResponse,
@@ -49,13 +50,15 @@ function buildApiBaseCandidates(): string[] {
     const candidates: string[] = [];
 
     const envBase = normalizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
-    if (envBase) {
-        candidates.push(envBase);
-    }
 
     if (typeof window !== 'undefined') {
-        const isLocal = isLocalHostname(window.location.hostname);
+        const sameOrigin = normalizeBaseUrl(window.location.origin);
+        if (sameOrigin) {
+            // Prefer same-origin so Vite dev proxy (`/api` -> :4000) is used on port 3000.
+            candidates.push(sameOrigin);
+        }
 
+        const isLocal = isLocalHostname(window.location.hostname);
         if (isLocal) {
             const localWithCurrentHost = normalizeBaseUrl(
                 `${window.location.protocol}//${window.location.hostname}:4000`
@@ -69,12 +72,11 @@ function buildApiBaseCandidates(): string[] {
                 candidates.push(localhost);
             }
         }
+    }
 
-        const sameOrigin = normalizeBaseUrl(window.location.origin);
-        const isSameOriginBackend = window.location.port === '4000';
-        if (sameOrigin && (!isLocal || isSameOriginBackend)) {
-            candidates.push(sameOrigin);
-        }
+    if (envBase) {
+        // Keep explicit env base as fallback, but do not let it override local dev proxy.
+        candidates.push(envBase);
     }
 
     const unique: string[] = [];
@@ -1281,6 +1283,85 @@ function normalizeExecutionPortfolioResponse(payload: any): BinanceExecutionPort
     };
 }
 
+function normalizeBithumbExecutionPortfolioResponse(payload: any): BithumbExecutionPortfolioResponse {
+    if (
+        !payload ||
+        toFiniteNumber(payload?.timestamp) === null ||
+        typeof payload?.connected !== 'boolean' ||
+        typeof payload?.configured !== 'boolean' ||
+        typeof payload?.symbol !== 'string' ||
+        !Array.isArray(payload?.walletBalances) ||
+        !Array.isArray(payload?.positions)
+    ) {
+        throw new Error('Invalid Bithumb execution portfolio payload');
+    }
+
+    const walletBalances = payload.walletBalances
+        .map((item: any) => {
+            if (!item || typeof item?.asset !== 'string') return null;
+            return {
+                asset: item.asset,
+                free: item?.free == null ? null : Number(item.free),
+                used: item?.used == null ? null : Number(item.used),
+                total: item?.total == null ? null : Number(item.total),
+            };
+        })
+        .filter(
+            (item): item is BithumbExecutionPortfolioResponse['walletBalances'][number] => item !== null
+        );
+
+    const positions = payload.positions
+        .map((item: any) => {
+            if (!item || typeof item?.symbol !== 'string') return null;
+            return {
+                symbol: item.symbol,
+                side: typeof item?.side === 'string' ? item.side : null,
+                contracts: item?.contracts == null ? null : Number(item.contracts),
+                contractSize: item?.contractSize == null ? null : Number(item.contractSize),
+                notional: item?.notional == null ? null : Number(item.notional),
+                leverage: item?.leverage == null ? null : Number(item.leverage),
+                entryPrice: item?.entryPrice == null ? null : Number(item.entryPrice),
+                markPrice: item?.markPrice == null ? null : Number(item.markPrice),
+                unrealizedPnl: item?.unrealizedPnl == null ? null : Number(item.unrealizedPnl),
+                liquidationPrice:
+                    item?.liquidationPrice == null ? null : Number(item.liquidationPrice),
+                marginMode: typeof item?.marginMode === 'string' ? item.marginMode : null,
+            };
+        })
+        .filter((item): item is BithumbExecutionPortfolioResponse['positions'][number] => item !== null);
+
+    const summaryPayload =
+        payload?.summary && typeof payload.summary === 'object' ? payload.summary : {};
+
+    return {
+        timestamp: Number(payload.timestamp),
+        connected: Boolean(payload.connected),
+        configured: Boolean(payload.configured),
+        marketType: 'spot',
+        symbol: payload.symbol,
+        testnet: false,
+        balanceAsset: typeof payload?.balanceAsset === 'string' ? payload.balanceAsset : 'KRW',
+        safety: normalizeExecutionSafetySummary(payload?.safety),
+        walletBalances,
+        positions,
+        summary: {
+            walletAssetFree:
+                summaryPayload?.walletAssetFree == null ? null : Number(summaryPayload.walletAssetFree),
+            walletAssetUsed:
+                summaryPayload?.walletAssetUsed == null ? null : Number(summaryPayload.walletAssetUsed),
+            walletAssetTotal:
+                summaryPayload?.walletAssetTotal == null ? null : Number(summaryPayload.walletAssetTotal),
+            walletBalanceCount: Number(summaryPayload?.walletBalanceCount ?? walletBalances.length),
+            activePositionCount: Number(summaryPayload?.activePositionCount ?? positions.length),
+            totalUnrealizedPnl:
+                summaryPayload?.totalUnrealizedPnl == null
+                    ? null
+                    : Number(summaryPayload.totalUnrealizedPnl),
+        },
+        error: typeof payload?.error === 'string' ? payload.error : undefined,
+    };
+}
+
 function normalizeExecutionFillsResponse(payload: any): BinanceExecutionFillsResponse {
     if (
         !payload ||
@@ -1411,22 +1492,58 @@ function normalizeExecutionCredentialsStatusResponse(payload: any): ExecutionCre
         throw new Error('Invalid execution credentials payload');
     }
 
+    const normalizeSource = (source: unknown): 'runtime' | 'env' | 'none' =>
+        source === 'runtime' ? 'runtime' : source === 'env' ? 'env' : 'none';
+
+    const legacyBinance = {
+        configured: Boolean(credentials.configured),
+        source: normalizeSource(credentials?.source),
+        keyHint: typeof credentials?.keyHint === 'string' ? credentials.keyHint : null,
+        updatedAt: credentials?.updatedAt == null ? null : Number(credentials.updatedAt),
+        persisted: Boolean(credentials?.persisted),
+    };
+    const rawBinance =
+        credentials?.binance && typeof credentials.binance === 'object'
+            ? credentials.binance
+            : null;
+    const rawBithumb =
+        credentials?.bithumb && typeof credentials.bithumb === 'object'
+            ? credentials.bithumb
+            : null;
+
     return {
         timestamp: Number(payload.timestamp),
         credentials: {
-            configured: Boolean(credentials.configured),
-            source:
-                credentials?.source === 'runtime'
-                    ? 'runtime'
-                    : credentials?.source === 'env'
-                        ? 'env'
-                        : 'none',
-            keyHint: typeof credentials?.keyHint === 'string' ? credentials.keyHint : null,
-            updatedAt:
-                credentials?.updatedAt == null ? null : Number(credentials.updatedAt),
-            persisted: Boolean(credentials?.persisted),
+            configured: legacyBinance.configured,
+            source: legacyBinance.source,
+            keyHint: legacyBinance.keyHint,
+            updatedAt: legacyBinance.updatedAt,
+            persisted: legacyBinance.persisted,
             envConfigured: Boolean(credentials?.envConfigured),
             runtimeConfigured: Boolean(credentials?.runtimeConfigured),
+            binance: {
+                configured: rawBinance ? Boolean(rawBinance.configured) : legacyBinance.configured,
+                source: rawBinance ? normalizeSource(rawBinance.source) : legacyBinance.source,
+                keyHint:
+                    rawBinance && typeof rawBinance.keyHint === 'string'
+                        ? rawBinance.keyHint
+                        : legacyBinance.keyHint,
+                updatedAt:
+                    rawBinance?.updatedAt == null
+                        ? legacyBinance.updatedAt
+                        : Number(rawBinance.updatedAt),
+                persisted: rawBinance ? Boolean(rawBinance.persisted) : legacyBinance.persisted,
+            },
+            bithumb: {
+                configured: Boolean(rawBithumb?.configured),
+                source: normalizeSource(rawBithumb?.source),
+                keyHint:
+                    rawBithumb && typeof rawBithumb.keyHint === 'string'
+                        ? rawBithumb.keyHint
+                        : null,
+                updatedAt: rawBithumb?.updatedAt == null ? null : Number(rawBithumb.updatedAt),
+                persisted: Boolean(rawBithumb?.persisted),
+            },
         },
     };
 }
@@ -1475,6 +1592,11 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
                 ? 'sell'
                 : null;
 
+    const orderBalancePct =
+        toFiniteNumber(enginePayload?.orderBalancePct ?? enginePayload?.amount) ?? 0;
+    const lastOrderAmount =
+        toFiniteNumber(enginePayload?.lastOrderAmount) ?? null;
+
     return {
         timestamp: Number(payload.timestamp),
         safety: normalizeExecutionSafetySummary(payload?.safety),
@@ -1483,7 +1605,7 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
             busy: Boolean(enginePayload.busy),
             marketType: normalizeExecutionMarketType(enginePayload.marketType),
             symbol: typeof enginePayload?.symbol === 'string' ? enginePayload.symbol : '',
-            amount: Number(enginePayload?.amount ?? 0),
+            orderBalancePct,
             dryRun: Boolean(enginePayload?.dryRun),
             premiumBasis,
             entryThreshold: Number(enginePayload?.entryThreshold ?? 0),
@@ -1500,6 +1622,7 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
             lastOrderSide,
             lastOrderId:
                 typeof enginePayload?.lastOrderId === 'string' ? enginePayload.lastOrderId : null,
+            lastOrderAmount,
             lastPremium: enginePayload?.lastPremium == null ? null : Number(enginePayload.lastPremium),
             lastEffectivePremium:
                 enginePayload?.lastEffectivePremium == null
@@ -1657,6 +1780,22 @@ export const fetchExecutionPortfolio = async (options: {
     );
 };
 
+export const fetchBithumbExecutionPortfolio = async (options: {
+    symbol?: string;
+    balanceLimit?: number;
+} = {}): Promise<BithumbExecutionPortfolioResponse> => {
+    const params = new URLSearchParams();
+    if (options.symbol && options.symbol.trim()) params.set('symbol', options.symbol.trim());
+    if (Number.isFinite(options.balanceLimit ?? NaN)) {
+        params.set('balanceLimit', String(options.balanceLimit));
+    }
+    return await fetchApi(
+        `/api/execution/bithumb/portfolio?${params.toString()}`,
+        'Bithumb execution portfolio API',
+        normalizeBithumbExecutionPortfolioResponse
+    );
+};
+
 export const fetchExecutionFills = async (options: {
     marketType?: ExecutionMarketType;
     symbol?: string;
@@ -1709,8 +1848,10 @@ export const fetchExecutionCredentialsStatus = async (): Promise<ExecutionCreden
 };
 
 export const updateExecutionCredentials = async (request: {
-    apiKey: string;
-    apiSecret: string;
+    apiKey?: string;
+    apiSecret?: string;
+    bithumbApiKey?: string;
+    bithumbApiSecret?: string;
     persist?: boolean;
 }): Promise<ExecutionCredentialsStatusResponse> => {
     return await fetchApi(
@@ -1812,10 +1953,14 @@ export const stopExecutionEngine = async (
 
 // --- Discord Config API ---
 
+export interface PremiumAlertThreshold {
+    id: string;
+    value: number;
+}
+
 export interface DiscordNotificationSettings {
     premiumAlertEnabled: boolean;
-    premiumAlertThresholdHigh: number;
-    premiumAlertThresholdLow: number;
+    premiumAlertThresholds: PremiumAlertThreshold[];
     periodicReportEnabled: boolean;
     reportIntervalMinutes: number;
 }
@@ -1824,6 +1969,17 @@ export interface DiscordConfigResponse {
     configured: boolean;
     webhookUrlMasked: string;
     notifications: DiscordNotificationSettings;
+}
+
+function normalizeThresholds(raw: any): PremiumAlertThreshold[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .filter((t: any) => t && Number.isFinite(Number(t.value)))
+        .slice(0, 10)
+        .map((t: any) => ({
+            id: typeof t.id === 'string' && t.id ? t.id : `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            value: Number(t.value),
+        }));
 }
 
 export const fetchDiscordConfig = async (): Promise<DiscordConfigResponse> => {
@@ -1835,8 +1991,7 @@ export const fetchDiscordConfig = async (): Promise<DiscordConfigResponse> => {
             webhookUrlMasked: typeof p?.webhookUrlMasked === 'string' ? p.webhookUrlMasked : '',
             notifications: {
                 premiumAlertEnabled: Boolean(p?.notifications?.premiumAlertEnabled),
-                premiumAlertThresholdHigh: Number(p?.notifications?.premiumAlertThresholdHigh ?? 3.0),
-                premiumAlertThresholdLow: Number(p?.notifications?.premiumAlertThresholdLow ?? -1.0),
+                premiumAlertThresholds: normalizeThresholds(p?.notifications?.premiumAlertThresholds),
                 periodicReportEnabled: p?.notifications?.periodicReportEnabled !== false,
                 reportIntervalMinutes: Number(p?.notifications?.reportIntervalMinutes ?? 60),
             },
@@ -1857,8 +2012,7 @@ export const updateDiscordConfig = async (
             message: typeof p?.message === 'string' ? p.message : '',
             notifications: {
                 premiumAlertEnabled: Boolean(p?.notifications?.premiumAlertEnabled),
-                premiumAlertThresholdHigh: Number(p?.notifications?.premiumAlertThresholdHigh ?? 3.0),
-                premiumAlertThresholdLow: Number(p?.notifications?.premiumAlertThresholdLow ?? -1.0),
+                premiumAlertThresholds: normalizeThresholds(p?.notifications?.premiumAlertThresholds),
                 periodicReportEnabled: p?.notifications?.periodicReportEnabled !== false,
                 reportIntervalMinutes: Number(p?.notifications?.reportIntervalMinutes ?? 60),
             },
@@ -1885,4 +2039,3 @@ export const sendDiscordTest = async (): Promise<{ success: boolean; message: st
         }
     );
 };
-

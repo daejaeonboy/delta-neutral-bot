@@ -250,6 +250,20 @@ export interface ExecutionCredentialsStatusResponse {
     persisted: boolean;
     envConfigured: boolean;
     runtimeConfigured: boolean;
+    binance?: {
+      configured: boolean;
+      source: 'runtime' | 'env' | 'none';
+      keyHint: string | null;
+      updatedAt: number | null;
+      persisted: boolean;
+    };
+    bithumb?: {
+      configured: boolean;
+      source: 'runtime' | 'env' | 'none';
+      keyHint: string | null;
+      updatedAt: number | null;
+      persisted: boolean;
+    };
   };
 }
 
@@ -293,6 +307,45 @@ export interface BinanceExecutionPortfolioResponse {
   connected: boolean;
   configured: boolean;
   marketType: ExecutionMarketType;
+  symbol: string;
+  testnet: boolean;
+  balanceAsset: string;
+  safety?: ExecutionSafetySummary;
+  walletBalances: Array<{
+    asset: string;
+    free: number | null;
+    used: number | null;
+    total: number | null;
+  }>;
+  positions: Array<{
+    symbol: string;
+    side: string | null;
+    contracts: number | null;
+    contractSize: number | null;
+    notional: number | null;
+    leverage: number | null;
+    entryPrice: number | null;
+    markPrice: number | null;
+    unrealizedPnl: number | null;
+    liquidationPrice: number | null;
+    marginMode: string | null;
+  }>;
+  summary: {
+    walletAssetFree: number | null;
+    walletAssetUsed: number | null;
+    walletAssetTotal: number | null;
+    walletBalanceCount: number;
+    activePositionCount: number;
+    totalUnrealizedPnl: number | null;
+  };
+  error?: string;
+}
+
+export interface BithumbExecutionPortfolioResponse {
+  timestamp: number;
+  connected: boolean;
+  configured: boolean;
+  marketType: 'spot';
   symbol: string;
   testnet: boolean;
   balanceAsset: string;
@@ -401,7 +454,7 @@ export interface ExecutionEngineState {
   busy: boolean;
   marketType: ExecutionMarketType;
   symbol: string;
-  amount: number;
+  orderBalancePct: number;
   dryRun: boolean;
   premiumBasis: 'USD' | 'USDT';
   entryThreshold: number;
@@ -416,6 +469,7 @@ export interface ExecutionEngineState {
   lastOrderAt: number | null;
   lastOrderSide: 'buy' | 'sell' | null;
   lastOrderId: string | null;
+  lastOrderAmount: number | null;
   lastPremium: number | null;
   lastEffectivePremium: number | null;
   lastMarketDataTimestamp: number | null;
@@ -456,11 +510,11 @@ export interface ExecutionEngineReadinessResponse {
 export interface StartExecutionEngineRequest {
   marketType: ExecutionMarketType;
   symbol?: string;
-  amount: number;
   dryRun: boolean;
   premiumBasis?: 'USD' | 'USDT';
   entryThreshold: number;
   exitThreshold: number;
+  orderBalancePct: number;
 }
 
 export interface TradeLog {
