@@ -134,15 +134,28 @@ const executionEngineAutoDryRun = !['0', 'false', 'no', 'off'].includes(rawExecu
 const rawExecutionEngineAutoMarketType = (process.env.EXECUTION_ENGINE_AUTO_MARKET_TYPE ?? binanceExecutionMarketType).trim().toLowerCase();
 const executionEngineAutoMarketType = rawExecutionEngineAutoMarketType === 'usdm' ? 'usdm' : 'coinm';
 const executionEngineAutoSymbol = (process.env.EXECUTION_ENGINE_AUTO_SYMBOL ?? '').trim();
-const parsedExecutionEngineAutoBalancePct = Number(
-    process.env.EXECUTION_ENGINE_AUTO_BALANCE_PCT ?? process.env.EXECUTION_ENGINE_AUTO_AMOUNT
+const parsedExecutionEngineAutoEntryPct = Number(
+    process.env.EXECUTION_ENGINE_AUTO_ENTRY_PCT ??
+        process.env.EXECUTION_ENGINE_AUTO_BALANCE_PCT ??
+        process.env.EXECUTION_ENGINE_AUTO_AMOUNT
 );
-const executionEngineAutoBalancePct =
-    Number.isFinite(parsedExecutionEngineAutoBalancePct) &&
-        parsedExecutionEngineAutoBalancePct > 0 &&
-        parsedExecutionEngineAutoBalancePct <= 100
-        ? parsedExecutionEngineAutoBalancePct
+const parsedExecutionEngineAutoExitPct = Number(
+    process.env.EXECUTION_ENGINE_AUTO_EXIT_PCT ??
+        process.env.EXECUTION_ENGINE_AUTO_BALANCE_PCT ??
+        process.env.EXECUTION_ENGINE_AUTO_AMOUNT
+);
+const executionEngineAutoEntryPct =
+    Number.isFinite(parsedExecutionEngineAutoEntryPct) &&
+        parsedExecutionEngineAutoEntryPct > 0 &&
+        parsedExecutionEngineAutoEntryPct <= 100
+        ? parsedExecutionEngineAutoEntryPct
         : 1;
+const executionEngineAutoExitPct =
+    Number.isFinite(parsedExecutionEngineAutoExitPct) &&
+        parsedExecutionEngineAutoExitPct > 0 &&
+        parsedExecutionEngineAutoExitPct <= 100
+        ? parsedExecutionEngineAutoExitPct
+        : executionEngineAutoEntryPct;
 const parsedExecutionEngineAutoEntryThreshold = Number(process.env.EXECUTION_ENGINE_AUTO_ENTRY_THRESHOLD);
 const executionEngineAutoEntryThreshold =
     Number.isFinite(parsedExecutionEngineAutoEntryThreshold)
@@ -271,7 +284,8 @@ const executionEngineState = {
     busy: false,
     marketType: binanceExecutionMarketType,
     symbol: defaultExecutionSymbolByMarketType(binanceExecutionMarketType),
-    orderBalancePct: 0,
+    orderBalancePctEntry: 0,
+    orderBalancePctExit: 0,
     dryRun: true,
     premiumBasis: 'USD',
     entryThreshold: 0,
@@ -1180,6 +1194,23 @@ function buildExecutionOrderContextMap() {
     return map;
 }
 
+function buildBithumbOrderContextMap() {
+    const map = new Map();
+    for (let index = runtimeEvents.length - 1; index >= 0; index -= 1) {
+        const event = runtimeEvents[index];
+        if (!event || event.event !== 'api_execution_bithumb_order_success') continue;
+
+        const orderId = normalizeExecutionOrderIdToken(event.orderId);
+        if (!orderId || map.has(orderId)) continue;
+
+        const strategyContext = parseExecutionStrategyContext(event.strategyContext);
+        if (!strategyContext) continue;
+
+        map.set(orderId, strategyContext);
+    }
+    return map;
+}
+
 function pruneExecutionIdempotencyStore() {
     if (executionIdempotencyStore.size === 0) return;
 
@@ -1844,7 +1875,8 @@ function getExecutionEngineSnapshot() {
         busy: executionEngineState.busy,
         marketType: executionEngineState.marketType,
         symbol: executionEngineState.symbol,
-        orderBalancePct: round(executionEngineState.orderBalancePct, 4),
+        orderBalancePctEntry: round(executionEngineState.orderBalancePctEntry, 4),
+        orderBalancePctExit: round(executionEngineState.orderBalancePctExit, 4),
         dryRun: executionEngineState.dryRun,
         premiumBasis: executionEngineState.premiumBasis,
         entryThreshold: round(executionEngineState.entryThreshold, 6),
@@ -1899,14 +1931,17 @@ function restoreExecutionEngineStateFromDisk() {
 
         executionEngineState.marketType = normalizeExecutionMarketType(engine.marketType);
         executionEngineState.symbol = parseExecutionSymbol(engine.symbol, executionEngineState.marketType);
-        const rawOrderBalancePct = toFiniteNumber(engine.orderBalancePct);
-        const legacyAmount = toFiniteNumber(engine.amount);
-        const resolvedOrderBalancePct = Number.isFinite(rawOrderBalancePct) && rawOrderBalancePct > 0
-            ? Math.min(100, rawOrderBalancePct)
-            : Number.isFinite(legacyAmount) && legacyAmount > 0 && legacyAmount <= 100
-                ? legacyAmount
-                : 0;
-        executionEngineState.orderBalancePct = resolvedOrderBalancePct;
+        const rawEntryPct = toFiniteNumber(engine.orderBalancePctEntry);
+        const rawExitPct = toFiniteNumber(engine.orderBalancePctExit);
+        const legacyPct = toFiniteNumber(engine.orderBalancePct ?? engine.amount);
+        const resolvedLegacyPct =
+            Number.isFinite(legacyPct) && legacyPct > 0 ? Math.min(100, legacyPct) : 0;
+        const resolvedEntryPct =
+            Number.isFinite(rawEntryPct) && rawEntryPct > 0 ? Math.min(100, rawEntryPct) : resolvedLegacyPct;
+        const resolvedExitPct =
+            Number.isFinite(rawExitPct) && rawExitPct > 0 ? Math.min(100, rawExitPct) : resolvedLegacyPct;
+        executionEngineState.orderBalancePctEntry = resolvedEntryPct;
+        executionEngineState.orderBalancePctExit = resolvedExitPct;
         executionEngineState.dryRun = parseBoolean(engine.dryRun, true);
         executionEngineState.premiumBasis = normalizePremiumBasis(engine.premiumBasis);
         executionEngineState.entryThreshold = parseNumber(engine.entryThreshold, 0, -20, 40);
@@ -1974,7 +2009,8 @@ function restoreExecutionEngineStateFromDisk() {
             symbol: executionEngineState.symbol,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
-            orderBalancePct: round(executionEngineState.orderBalancePct, 4),
+            orderBalancePctEntry: round(executionEngineState.orderBalancePctEntry, 4),
+            orderBalancePctExit: round(executionEngineState.orderBalancePctExit, 4),
             entryThreshold: round(executionEngineState.entryThreshold, 6),
             exitThreshold: round(executionEngineState.exitThreshold, 6),
             positionState: executionEngineState.positionState,
@@ -2027,17 +2063,18 @@ function stopExecutionEngine(reason = 'manual-stop') {
 }
 
 async function fetchExecutionEngineMarketSnapshot() {
-    const [upbit, globalTicker, fxRate, bithumbPrice] = await Promise.all([
+    const [upbit, globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
         fetchUpbitBtcAndUsdtKrw(),
         fetchGlobalBtcUsdt(),
         getUsdKrwRate(),
         fetchBithumbBtcKrw().catch(() => null),
+        fetchBithumbUsdtKrw().catch(() => null),
     ]);
 
     const krwPrice = bithumbPrice ?? upbit.btcKrw;
     const usdPrice = globalTicker.price;
     const exchangeRate = fxRate.usdKrw;
-    const usdtKrwRate = upbit.usdtKrw;
+    const usdtKrwRate = bithumbUsdt ?? upbit.usdtKrw;
     const normalizedGlobalKrwPrice = usdPrice * exchangeRate;
     const kimchiPremiumPercent = ((krwPrice / normalizedGlobalKrwPrice) - 1) * 100;
     const usdtConversionRate = usdtKrwRate > 0 ? usdtKrwRate : exchangeRate;
@@ -2508,7 +2545,10 @@ async function runExecutionEngineTick() {
         let binanceClient = null;
 
         try {
-            const rawPct = executionEngineState.orderBalancePct;
+            const rawPct =
+                action === 'ENTRY'
+                    ? executionEngineState.orderBalancePctEntry
+                    : executionEngineState.orderBalancePctExit;
             const pctFactor =
                 Number.isFinite(rawPct) && rawPct > 0
                     ? Math.min(100, rawPct) / 100
@@ -2794,7 +2834,8 @@ async function runExecutionEngineTick() {
 async function startExecutionEngine({
     marketType,
     symbol,
-    orderBalancePct,
+    orderBalancePctEntry,
+    orderBalancePctExit,
     dryRun,
     premiumBasis,
     entryThreshold,
@@ -2823,9 +2864,24 @@ async function startExecutionEngine({
         }
     }
 
-    const resolvedOrderBalancePct = parseNumber(orderBalancePct, NaN, 0.0001, 100);
-    if (!Number.isFinite(resolvedOrderBalancePct) || resolvedOrderBalancePct <= 0 || resolvedOrderBalancePct > 100) {
-        throw new Error('orderBalancePct must be between 0 and 100');
+    const resolvedOrderBalancePctEntry = parseNumber(orderBalancePctEntry, NaN, 0.0001, 100);
+    const resolvedOrderBalancePctExitRaw = parseNumber(orderBalancePctExit, NaN, 0.0001, 100);
+    const resolvedOrderBalancePctExit = Number.isFinite(resolvedOrderBalancePctExitRaw)
+        ? resolvedOrderBalancePctExitRaw
+        : resolvedOrderBalancePctEntry;
+    if (
+        !Number.isFinite(resolvedOrderBalancePctEntry) ||
+        resolvedOrderBalancePctEntry <= 0 ||
+        resolvedOrderBalancePctEntry > 100
+    ) {
+        throw new Error('orderBalancePctEntry must be between 0 and 100');
+    }
+    if (
+        !Number.isFinite(resolvedOrderBalancePctExit) ||
+        resolvedOrderBalancePctExit <= 0 ||
+        resolvedOrderBalancePctExit > 100
+    ) {
+        throw new Error('orderBalancePctExit must be between 0 and 100');
     }
 
     const resolvedEntryThreshold = parseNumber(entryThreshold, NaN, -20, 40);
@@ -2839,7 +2895,8 @@ async function startExecutionEngine({
 
     executionEngineState.marketType = normalizeExecutionMarketType(marketType);
     executionEngineState.symbol = parseExecutionSymbol(symbol, executionEngineState.marketType);
-    executionEngineState.orderBalancePct = resolvedOrderBalancePct;
+    executionEngineState.orderBalancePctEntry = resolvedOrderBalancePctEntry;
+    executionEngineState.orderBalancePctExit = resolvedOrderBalancePctExit;
     executionEngineState.dryRun = resolvedDryRun;
     executionEngineState.premiumBasis = premiumBasis === 'USDT' ? 'USDT' : 'USD';
     executionEngineState.entryThreshold = resolvedEntryThreshold;
@@ -2888,6 +2945,8 @@ async function startExecutionEngine({
         symbol: executionEngineState.symbol,
         dryRun: executionEngineState.dryRun,
         premiumBasis: executionEngineState.premiumBasis,
+        orderBalancePctEntry: executionEngineState.orderBalancePctEntry,
+        orderBalancePctExit: executionEngineState.orderBalancePctExit,
         entryThreshold: executionEngineState.entryThreshold,
         exitThreshold: executionEngineState.exitThreshold,
         positionState: executionEngineState.positionState,
@@ -3254,6 +3313,19 @@ async function fetchBithumbBtcKrw() {
     }
 
     return btcKrw;
+}
+
+async function fetchBithumbUsdtKrw() {
+    const data = await fetchJson('https://api.bithumb.com/public/ticker/USDT_KRW', {
+        context: 'bithumb-usdt',
+    });
+    const usdtKrw = toFiniteNumber(data?.data?.closing_price);
+
+    if (!Number.isFinite(usdtKrw) || usdtKrw <= 0) {
+        throw new Error('Invalid USDT_KRW price from Bithumb');
+    }
+
+    return usdtKrw;
 }
 
 async function fetchBinanceCoinMBtcUsd() {
@@ -3975,6 +4047,15 @@ function calcEstimatedFundingFeeUsdt({
 
 async function fetchUsdtKrwRate() {
     try {
+        const bithumb = await fetchBithumbUsdtKrw();
+        if (Number.isFinite(bithumb) && bithumb > 0) {
+            return bithumb;
+        }
+    } catch (error) {
+        console.warn(`USDT/KRW provider failed (bithumb): ${error.message}`);
+    }
+
+    try {
         const upbit = await fetchUpbitBtcAndUsdtKrw();
         if (Number.isFinite(upbit.usdtKrw) && upbit.usdtKrw > 0) {
             return upbit.usdtKrw;
@@ -4497,11 +4578,12 @@ loadPremiumHistoryFromDisk();
 app.get('/api/ticker', async (req, res) => {
     const startedAt = Date.now();
     try {
-        const [upbit, globalTicker, fxRate, bithumbPrice] = await Promise.all([
+        const [upbit, globalTicker, fxRate, bithumbPrice, bithumbUsdt] = await Promise.all([
             fetchUpbitBtcAndUsdtKrw(),
             fetchGlobalBtcUsdt(),
             getUsdKrwRate(),
             fetchBithumbBtcKrw().catch(() => null),
+            fetchBithumbUsdtKrw().catch(() => null),
         ]);
 
         // Primary domestic price: Bithumb (fallback to Upbit)
@@ -4510,7 +4592,8 @@ app.get('/api/ticker', async (req, res) => {
 
         const usdPrice = globalTicker.price;
         const exchangeRate = fxRate.usdKrw;
-        const usdtKrwRate = upbit.usdtKrw;
+        const usdtKrwRate = bithumbUsdt ?? upbit.usdtKrw;
+        const conversionSource = bithumbUsdt ? 'bithumb:USDT_KRW' : 'upbit:KRW-USDT';
 
         // Primary kimchi premium: USD/KRW (real market premium, matches Korean crypto sites)
         const normalizedGlobalKrwPrice = usdPrice * exchangeRate;
@@ -4540,7 +4623,7 @@ app.get('/api/ticker', async (req, res) => {
                 domestic: domesticSource,
                 global: globalTicker.source,
                 fx: fxRate.source,
-                conversion: fxRate.source,
+                conversion: conversionSource,
             },
         };
 
@@ -5816,17 +5899,30 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
                 : 'engine entryThreshold must be greater than exitThreshold',
     });
 
-    const orderBalancePctOk =
-        Number.isFinite(executionEngineState.orderBalancePct) &&
-        executionEngineState.orderBalancePct > 0 &&
-        executionEngineState.orderBalancePct <= 100;
+    const orderBalancePctEntryOk =
+        Number.isFinite(executionEngineState.orderBalancePctEntry) &&
+        executionEngineState.orderBalancePctEntry > 0 &&
+        executionEngineState.orderBalancePctEntry <= 100;
     checks.push({
-        key: 'engine_order_balance_pct_valid',
-        ok: orderBalancePctOk,
+        key: 'engine_order_balance_pct_entry_valid',
+        ok: orderBalancePctEntryOk,
         severity: 'error',
-        message: orderBalancePctOk
-            ? 'engine order balance pct is configured'
-            : 'engine order balance pct must be between 0 and 100',
+        message: orderBalancePctEntryOk
+            ? 'engine entry order balance pct is configured'
+            : 'engine entry order balance pct must be between 0 and 100',
+    });
+
+    const orderBalancePctExitOk =
+        Number.isFinite(executionEngineState.orderBalancePctExit) &&
+        executionEngineState.orderBalancePctExit > 0 &&
+        executionEngineState.orderBalancePctExit <= 100;
+    checks.push({
+        key: 'engine_order_balance_pct_exit_valid',
+        ok: orderBalancePctExitOk,
+        severity: 'error',
+        message: orderBalancePctExitOk
+            ? 'engine exit order balance pct is configured'
+            : 'engine exit order balance pct must be between 0 and 100',
     });
 
     let connectivityOk = false;
@@ -6176,6 +6272,97 @@ app.get('/api/execution/binance/fills', async (req, res) => {
     }
 });
 
+app.get('/api/execution/bithumb/fills', async (req, res) => {
+    const startedAt = Date.now();
+    const symbol = parseOptionalString(req.query.symbol, 32) ?? 'BTC/KRW';
+    const limit = parseLimit(req.query.limit, 50, 200);
+    const sinceQuery = parseTimestampQuery(req.query.since);
+
+    if (!sinceQuery.valid) {
+        recordRuntimeEvent('warn', 'api_execution_bithumb_fills_validation_failed', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            since: sinceQuery.raw,
+            reason: 'invalid_since',
+        });
+        res.status(400).json({
+            error: 'since must be unix ms timestamp or ISO date string',
+        });
+        return;
+    }
+
+    try {
+        const client = await getBithumbExecutionClient(true);
+        const trades = await client.fetchMyTrades(
+            symbol,
+            Number.isFinite(sinceQuery.value) ? sinceQuery.value : undefined,
+            limit
+        );
+        const orderContextMap = buildBithumbOrderContextMap();
+
+        const items = (Array.isArray(trades) ? trades : []).map((trade) => ({
+            id: trade.id ?? null,
+            orderId: normalizeExecutionOrderIdToken(trade.order),
+            timestamp: Number.isFinite(toFiniteNumber(trade.timestamp))
+                ? Number(trade.timestamp)
+                : null,
+            datetime: trade.datetime ?? null,
+            side: trade.side ?? null,
+            type: trade.type ?? null,
+            amount: toNullableRounded(trade.amount, 8),
+            price: toNullableRounded(trade.price, 8),
+            cost: toNullableRounded(trade.cost, 8),
+            fee: trade.fee
+                ? {
+                    currency: trade.fee.currency ?? null,
+                    cost: toNullableRounded(trade.fee.cost, 8),
+                    rate: toNullableRounded(trade.fee.rate, 8),
+                }
+                : null,
+            realizedPnl: toNullableRounded(trade.info?.realizedPnl, 8),
+            maker: typeof trade.maker === 'boolean' ? trade.maker : null,
+            takerOrMaker: trade.takerOrMaker ?? null,
+            strategyContext: orderContextMap.get(normalizeExecutionOrderIdToken(trade.order)) ?? null,
+        }));
+
+        const payload = {
+            timestamp: Date.now(),
+            marketType: 'spot',
+            symbol,
+            testnet: false,
+            safety: getExecutionSafetySummary(),
+            limit,
+            since: Number.isFinite(sinceQuery.value) ? sinceQuery.value : null,
+            count: items.length,
+            fills: items,
+        };
+
+        res.json(payload);
+        recordRuntimeEvent('info', 'api_execution_bithumb_fills_success', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            count: items.length,
+            since: payload.since,
+        });
+    } catch (error) {
+        const message = toErrorMessage(error);
+        recordRuntimeEvent('error', 'api_execution_bithumb_fills_failure', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            limit,
+            error: message,
+        });
+        res.status(500).json({
+            timestamp: Date.now(),
+            marketType: 'spot',
+            symbol,
+            testnet: false,
+            safety: getExecutionSafetySummary(),
+            error: `Failed to fetch Bithumb fills: ${message}`,
+        });
+    }
+});
+
 app.get('/api/execution/safety', (req, res) => {
     res.json({
         timestamp: Date.now(),
@@ -6217,7 +6404,12 @@ app.post('/api/execution/engine/start', async (req, res) => {
     const premiumBasis = normalizePremiumBasis(body.premiumBasis);
     const entryThreshold = toFiniteNumber(body.entryThreshold);
     const exitThreshold = toFiniteNumber(body.exitThreshold);
-    const orderBalancePct = toFiniteNumber(body.orderBalancePct ?? body.amount);
+    const orderBalancePctEntry = toFiniteNumber(
+        body.orderBalancePctEntry ?? body.orderBalancePct ?? body.amount
+    );
+    const orderBalancePctExit = toFiniteNumber(
+        body.orderBalancePctExit ?? body.orderBalancePct ?? body.amount
+    );
 
     if (!Number.isFinite(entryThreshold) || !Number.isFinite(exitThreshold)) {
         res.status(400).json({ error: 'entryThreshold and exitThreshold are required' });
@@ -6229,8 +6421,13 @@ app.post('/api/execution/engine/start', async (req, res) => {
         return;
     }
 
-    if (!Number.isFinite(orderBalancePct) || orderBalancePct <= 0 || orderBalancePct > 100) {
-        res.status(400).json({ error: 'orderBalancePct must be between 0 and 100' });
+    if (!Number.isFinite(orderBalancePctEntry) || orderBalancePctEntry <= 0 || orderBalancePctEntry > 100) {
+        res.status(400).json({ error: 'orderBalancePctEntry must be between 0 and 100' });
+        return;
+    }
+
+    if (!Number.isFinite(orderBalancePctExit) || orderBalancePctExit <= 0 || orderBalancePctExit > 100) {
+        res.status(400).json({ error: 'orderBalancePctExit must be between 0 and 100' });
         return;
     }
 
@@ -6320,7 +6517,8 @@ app.post('/api/execution/engine/start', async (req, res) => {
             symbol,
             dryRun,
             premiumBasis,
-            orderBalancePct,
+            orderBalancePctEntry,
+            orderBalancePctExit,
             entryThreshold,
             exitThreshold,
         });
@@ -6799,7 +6997,7 @@ app.get('/api/backtest/premium/history', async (req, res) => {
 
 app.get('/api/execution/bithumb/portfolio', async (req, res) => {
     const startedAt = Date.now();
-    const symbol = parseExecutionSymbol(req.query.symbol, 'coinm');
+    const symbol = parseOptionalString(req.query.symbol, 32) ?? 'BTC/KRW';
     const balanceLimit = Math.floor(parseNumber(req.query.balanceLimit, 8, 1, 30));
     const hasCredentials = hasBithumbExecutionCredentials();
 
@@ -6903,7 +7101,7 @@ app.get('/api/execution/bithumb/portfolio', async (req, res) => {
 app.post('/api/execution/bithumb/order', async (req, res) => {
     const startedAt = Date.now();
     const body = req.body && typeof req.body === 'object' ? req.body : {};
-    const symbol = parseExecutionSymbol(body.symbol, 'coinm'); // Bithumb typically uses BTC/KRW format in ccxt
+    const symbol = parseOptionalString(body.symbol, 32) ?? 'BTC/KRW';
     const side = parseExecutionOrderSide(body.side);
     const type = parseExecutionOrderType(body.type ?? 'market');
     const amount = toFiniteNumber(body.amount);
@@ -7280,7 +7478,8 @@ app.listen(port, () => {
             symbol:
                 executionEngineAutoSymbol ||
                 defaultExecutionSymbolByMarketType(executionEngineAutoMarketType),
-            orderBalancePct: executionEngineAutoBalancePct,
+            orderBalancePctEntry: executionEngineAutoEntryPct,
+            orderBalancePctExit: executionEngineAutoExitPct,
             dryRun: executionEngineAutoDryRun,
             premiumBasis: executionEngineAutoPremiumBasis,
             entryThreshold: executionEngineAutoEntryThreshold,
@@ -7290,7 +7489,8 @@ app.listen(port, () => {
         : {
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
-            orderBalancePct: executionEngineState.orderBalancePct,
+            orderBalancePctEntry: executionEngineState.orderBalancePctEntry,
+            orderBalancePctExit: executionEngineState.orderBalancePctExit,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
             entryThreshold: executionEngineState.entryThreshold,
@@ -7298,14 +7498,19 @@ app.listen(port, () => {
             source: 'restored-state',
         };
 
-    if (
-        !Number.isFinite(autoStartConfig.orderBalancePct) ||
-        autoStartConfig.orderBalancePct <= 0 ||
-        autoStartConfig.orderBalancePct > 100
-    ) {
+    const autoEntryPctOk =
+        Number.isFinite(autoStartConfig.orderBalancePctEntry) &&
+        autoStartConfig.orderBalancePctEntry > 0 &&
+        autoStartConfig.orderBalancePctEntry <= 100;
+    const autoExitPctOk =
+        Number.isFinite(autoStartConfig.orderBalancePctExit) &&
+        autoStartConfig.orderBalancePctExit > 0 &&
+        autoStartConfig.orderBalancePctExit <= 100;
+    if (!autoEntryPctOk || !autoExitPctOk) {
         recordRuntimeEvent('error', 'execution_engine_autostart_invalid_order_balance_pct', {
             source: autoStartConfig.source,
-            orderBalancePct: autoStartConfig.orderBalancePct,
+            orderBalancePctEntry: autoStartConfig.orderBalancePctEntry,
+            orderBalancePctExit: autoStartConfig.orderBalancePctExit,
         });
         return;
     }
@@ -7329,7 +7534,8 @@ app.listen(port, () => {
                 symbol: autoStartConfig.symbol,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
-                orderBalancePct: round(autoStartConfig.orderBalancePct, 4),
+                orderBalancePctEntry: round(autoStartConfig.orderBalancePctEntry, 4),
+                orderBalancePctExit: round(autoStartConfig.orderBalancePctExit, 4),
                 entryThreshold: round(autoStartConfig.entryThreshold, 6),
                 exitThreshold: round(autoStartConfig.exitThreshold, 6),
             });
@@ -7340,7 +7546,8 @@ app.listen(port, () => {
                 symbol: autoStartConfig.symbol,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
-                orderBalancePct: round(autoStartConfig.orderBalancePct, 4),
+                orderBalancePctEntry: round(autoStartConfig.orderBalancePctEntry, 4),
+                orderBalancePctExit: round(autoStartConfig.orderBalancePctExit, 4),
                 entryThreshold: round(autoStartConfig.entryThreshold, 6),
                 exitThreshold: round(autoStartConfig.exitThreshold, 6),
                 error: toErrorMessage(error),

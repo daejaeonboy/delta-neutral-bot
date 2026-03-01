@@ -399,7 +399,37 @@ export interface BinanceExecutionFill {
   maker: boolean | null;
   takerOrMaker: string | null;
   strategyContext?: {
-    action: 'ENTRY_SELL' | 'EXIT_BUY' | null;
+    action: 'ENTRY_SELL' | 'EXIT_BUY' | 'ENTRY_BUY' | 'EXIT_SELL' | null;
+    decisionTimestamp: number | null;
+    premiumPct: number | null;
+    effectivePremiumPct: number | null;
+    usdtKrwRate: number | null;
+    exchangeRate: number | null;
+    usdPrice: number | null;
+    krwPrice: number | null;
+  } | null;
+}
+
+export interface BithumbExecutionFill {
+  id: string | null;
+  orderId: string | null;
+  timestamp: number | null;
+  datetime: string | null;
+  side: string | null;
+  type: string | null;
+  amount: number | null;
+  price: number | null;
+  cost: number | null;
+  fee: null | {
+    currency: string | null;
+    cost: number | null;
+    rate: number | null;
+  };
+  realizedPnl: number | null;
+  maker: boolean | null;
+  takerOrMaker: string | null;
+  strategyContext?: {
+    action: 'ENTRY_SELL' | 'EXIT_BUY' | 'ENTRY_BUY' | 'EXIT_SELL' | null;
     decisionTimestamp: number | null;
     premiumPct: number | null;
     effectivePremiumPct: number | null;
@@ -420,6 +450,19 @@ export interface BinanceExecutionFillsResponse {
   since: number | null;
   count: number;
   fills: BinanceExecutionFill[];
+  error?: string;
+}
+
+export interface BithumbExecutionFillsResponse {
+  timestamp: number;
+  marketType: 'spot';
+  symbol: string;
+  testnet: boolean;
+  safety?: ExecutionSafetySummary;
+  limit: number;
+  since: number | null;
+  count: number;
+  fills: BithumbExecutionFill[];
   error?: string;
 }
 
@@ -454,7 +497,8 @@ export interface ExecutionEngineState {
   busy: boolean;
   marketType: ExecutionMarketType;
   symbol: string;
-  orderBalancePct: number;
+  orderBalancePctEntry: number;
+  orderBalancePctExit: number;
   dryRun: boolean;
   premiumBasis: 'USD' | 'USDT';
   entryThreshold: number;
@@ -514,7 +558,8 @@ export interface StartExecutionEngineRequest {
   premiumBasis?: 'USD' | 'USDT';
   entryThreshold: number;
   exitThreshold: number;
-  orderBalancePct: number;
+  orderBalancePctEntry: number;
+  orderBalancePctExit: number;
 }
 
 export interface TradeLog {

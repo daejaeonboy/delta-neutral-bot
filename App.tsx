@@ -6,6 +6,7 @@ import { BacktestPanel } from './components/BacktestPanel';
 import { PremiumChart } from './components/PremiumChart';
 import {
   BithumbExecutionPortfolioResponse,
+  BithumbExecutionFill,
   ExecutionCredentialsStatusResponse,
   ExecutionEngineReadinessResponse,
   BinanceExecutionFill,
@@ -27,6 +28,7 @@ import {
   fetchExecutionEngineStatus,
   fetchExecutionEngineReadiness,
   fetchExecutionFills,
+  fetchBithumbExecutionFills,
   fetchExecutionPortfolio,
   fetchBithumbExecutionPortfolio,
   fetchExecutionPosition,
@@ -70,13 +72,15 @@ const App: React.FC = () => {
   const [executionMarketType, setExecutionMarketType] = useState<ExecutionMarketType>('coinm');
   const [executionSymbol, setExecutionSymbol] = useState<string>(defaultSymbolByMarketType('coinm'));
   const [executionDryRun, setExecutionDryRun] = useState<boolean>(true);
-  const [executionOrderBalancePct, setExecutionOrderBalancePct] = useState<number>(10);
+  const [executionOrderBalancePctEntry, setExecutionOrderBalancePctEntry] = useState<number>(10);
+  const [executionOrderBalancePctExit, setExecutionOrderBalancePctExit] = useState<number>(10);
   const [executionStatus, setExecutionStatus] = useState<BinanceExecutionStatusResponse | null>(null);
   const [executionSafety, setExecutionSafety] = useState<ExecutionSafetyResponse | null>(null);
   const [executionPosition, setExecutionPosition] = useState<BinanceExecutionPositionResponse | null>(null);
   const [executionPortfolio, setExecutionPortfolio] = useState<BinanceExecutionPortfolioResponse | null>(null);
   const [bithumbPortfolio, setBithumbPortfolio] = useState<BithumbExecutionPortfolioResponse | null>(null);
   const [executionFills, setExecutionFills] = useState<BinanceExecutionFill[]>([]);
+  const [bithumbExecutionFills, setBithumbExecutionFills] = useState<BithumbExecutionFill[]>([]);
   const [executionEvents, setExecutionEvents] = useState<ExecutionEventsResponse['events']>([]);
   const [executionEngineStatus, setExecutionEngineStatus] = useState<ExecutionEngineStatusResponse | null>(null);
   const [executionReadiness, setExecutionReadiness] = useState<ExecutionEngineReadinessResponse | null>(null);
@@ -180,6 +184,10 @@ const App: React.FC = () => {
           symbol: executionSymbol.trim(),
           limit: 20,
         }),
+        fetchBithumbExecutionFills({
+          symbol: 'BTC/KRW',
+          limit: 20,
+        }),
         fetchExecutionEvents({
           limit: 30,
           marketType: executionMarketType,
@@ -244,20 +252,31 @@ const App: React.FC = () => {
         errors.push(fillsResult2.reason instanceof Error ? fillsResult2.reason.message : String(fillsResult2.reason));
       }
 
-      const eventsResult = settled[7];
+      const fillsResult3 = settled[7];
+      if (fillsResult3.status === 'fulfilled') {
+        setBithumbExecutionFills(fillsResult3.value.fills);
+      } else {
+        errors.push(fillsResult3.reason instanceof Error ? fillsResult3.reason.message : String(fillsResult3.reason));
+      }
+
+      const eventsResult = settled[8];
       if (eventsResult.status === 'fulfilled') {
         setExecutionEvents(eventsResult.value.events);
       } else {
         errors.push(eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason));
       }
 
-      const engineResult = settled[8];
+      const engineResult = settled[9];
       if (engineResult.status === 'fulfilled') {
         const engineStatus = engineResult.value;
         setExecutionEngineStatus(engineStatus);
-        const loadedOrderPct = engineStatus.engine.orderBalancePct;
-        if (Number.isFinite(loadedOrderPct) && loadedOrderPct > 0) {
-          setExecutionOrderBalancePct(loadedOrderPct);
+        const loadedEntryPct = engineStatus.engine.orderBalancePctEntry;
+        if (Number.isFinite(loadedEntryPct) && loadedEntryPct > 0) {
+          setExecutionOrderBalancePctEntry(loadedEntryPct);
+        }
+        const loadedExitPct = engineStatus.engine.orderBalancePctExit;
+        if (Number.isFinite(loadedExitPct) && loadedExitPct > 0) {
+          setExecutionOrderBalancePctExit(loadedExitPct);
         }
       } else {
         errors.push(engineResult.reason instanceof Error ? engineResult.reason.message : String(engineResult.reason));
@@ -367,8 +386,13 @@ const App: React.FC = () => {
           return;
         }
 
-        if (!Number.isFinite(executionOrderBalancePct) || executionOrderBalancePct <= 0 || executionOrderBalancePct > 100) {
-          setExecutionError('주문 비율(%)을 0~100 사이로 입력하세요.');
+        if (!Number.isFinite(executionOrderBalancePctEntry) || executionOrderBalancePctEntry <= 0 || executionOrderBalancePctEntry > 100) {
+          setExecutionError('진입 주문 비율(%)을 0~100 사이로 입력하세요.');
+          return;
+        }
+
+        if (!Number.isFinite(executionOrderBalancePctExit) || executionOrderBalancePctExit <= 0 || executionOrderBalancePctExit > 100) {
+          setExecutionError('청산 주문 비율(%)을 0~100 사이로 입력하세요.');
           return;
         }
 
@@ -396,7 +420,8 @@ const App: React.FC = () => {
           premiumBasis: 'USD',
           entryThreshold: config.entryThreshold,
           exitThreshold: config.exitThreshold,
-          orderBalancePct: executionOrderBalancePct,
+          orderBalancePctEntry: executionOrderBalancePctEntry,
+          orderBalancePctExit: executionOrderBalancePctExit,
         });
         setExecutionEngineStatus(response);
         setExecutionError(null);
@@ -416,7 +441,8 @@ const App: React.FC = () => {
     executionDryRun,
     executionEngineStatus?.engine.running,
     executionMarketType,
-    executionOrderBalancePct,
+    executionOrderBalancePctEntry,
+    executionOrderBalancePctExit,
     executionStatus?.connected,
     executionSymbol,
     isEngineSubmitting,
@@ -614,6 +640,11 @@ const App: React.FC = () => {
     `${executionPortfolioBalanceAsset} ${formatNullableNumber(executionWalletFree, 8)}`;
   const bithumbKrwTotal = bithumbPortfolioSummary?.walletAssetTotal ?? null;
   const bithumbKrwFree = bithumbPortfolioSummary?.walletAssetFree ?? null;
+  const combinedExecutionFills = useMemo(() => {
+    const binance = executionFills.map((fill) => ({ ...fill, exchange: 'binance' as const }));
+    const bithumb = bithumbExecutionFills.map((fill) => ({ ...fill, exchange: 'bithumb' as const }));
+    return [...binance, ...bithumb].sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+  }, [executionFills, bithumbExecutionFills]);
   const sidebarSections: Array<{ key: SidebarSection; label: string; description: string }> = [
     { key: 'automation', label: '자동매매', description: '실행 설정/리스크' },
     { key: 'portfolio', label: '포트폴리오', description: '잔고/체결/이벤트' },
@@ -1221,19 +1252,34 @@ const App: React.FC = () => {
                           </label>
                         </div>
 
-                        <label className="text-slate-400 flex flex-col gap-1">
-                          주문 비율 (%)
-                          <input
-                            type="number"
-                            min={0.1}
-                            max={100}
-                            step={0.1}
-                            value={Number.isFinite(executionOrderBalancePct) ? executionOrderBalancePct : 0}
-                            onChange={(e) => setExecutionOrderBalancePct(Number(e.target.value))}
-                            className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
-                            placeholder="예: 10"
-                          />
-                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            진입 주문 비율 (%)
+                            <input
+                              type="number"
+                              min={0.1}
+                              max={100}
+                              step={0.1}
+                              value={Number.isFinite(executionOrderBalancePctEntry) ? executionOrderBalancePctEntry : 0}
+                              onChange={(e) => setExecutionOrderBalancePctEntry(Number(e.target.value))}
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                              placeholder="예: 10"
+                            />
+                          </label>
+                          <label className="text-slate-400 flex flex-col gap-1">
+                            청산 주문 비율 (%)
+                            <input
+                              type="number"
+                              min={0.1}
+                              max={100}
+                              step={0.1}
+                              value={Number.isFinite(executionOrderBalancePctExit) ? executionOrderBalancePctExit : 0}
+                              onChange={(e) => setExecutionOrderBalancePctExit(Number(e.target.value))}
+                              className="bg-slate-800 border border-slate-700 rounded px-2 py-1.5 text-slate-100 font-mono focus:ring-1 focus:ring-emerald-500 outline-none"
+                              placeholder="예: 10"
+                            />
+                          </label>
+                        </div>
 
                         <label className="text-slate-400 flex items-center gap-2 p-1">
                           <input
@@ -1581,6 +1627,7 @@ const App: React.FC = () => {
                         <thead>
                           <tr className="text-slate-400 border-b border-slate-800">
                             <th className="py-2 pr-2 text-left">시간</th>
+                            <th className="py-2 pr-2 text-left">거래소</th>
                             <th className="py-2 pr-2 text-left">체결</th>
                             <th className="py-2 pr-2 text-right">합성환율(P)</th>
                             <th className="py-2 pr-2 text-right">김치프리미엄%</th>
@@ -1591,14 +1638,14 @@ const App: React.FC = () => {
                           </tr>
                         </thead>
                         <tbody>
-                          {executionFills.length === 0 ? (
+                          {combinedExecutionFills.length === 0 ? (
                             <tr>
-                              <td colSpan={8} className="py-4 text-center text-slate-500">
+                              <td colSpan={9} className="py-4 text-center text-slate-500">
                                 체결 내역이 없습니다.
                               </td>
                             </tr>
                           ) : (
-                            executionFills.slice(0, 12).map((fill, index) => {
+                            combinedExecutionFills.slice(0, 12).map((fill, index) => {
                               const ctx = fill.strategyContext ?? null;
                               const syntheticRate =
                                 ctx?.krwPrice != null && ctx?.usdPrice != null && ctx.usdPrice > 0
@@ -1612,9 +1659,12 @@ const App: React.FC = () => {
                                     : null;
 
                               return (
-                                <tr key={`${fill.id ?? 'fill'}-${index}`} className="border-b border-slate-900/70">
+                                <tr key={`${fill.exchange}-${fill.id ?? 'fill'}-${index}`} className="border-b border-slate-900/70">
                                   <td className="py-2 pr-2 text-slate-300">
                                     {fill.timestamp ? new Date(fill.timestamp).toLocaleString('ko-KR') : '-'}
+                                  </td>
+                                  <td className="py-2 pr-2 text-slate-300">
+                                    {fill.exchange === 'binance' ? '바이낸스' : '빗썸'}
                                   </td>
                                   <td className="py-2 pr-2 text-emerald-300 font-medium">성공</td>
                                   <td className="py-2 pr-2 text-right font-mono text-slate-300">

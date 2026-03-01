@@ -2,6 +2,7 @@ import {
     AuthSessionResponse,
     BithumbExecutionPortfolioResponse,
     BinanceExecutionFillsResponse,
+    BithumbExecutionFillsResponse,
     BinanceExecutionPortfolioResponse,
     BinanceExecutionPositionResponse,
     BinanceExecutionStatusResponse,
@@ -1069,7 +1070,11 @@ function normalizeExecutionStrategyContext(payload: any) {
             ? 'ENTRY_SELL'
             : payload?.action === 'EXIT_BUY'
                 ? 'EXIT_BUY'
-                : null;
+                : payload?.action === 'ENTRY_BUY'
+                    ? 'ENTRY_BUY'
+                    : payload?.action === 'EXIT_SELL'
+                        ? 'EXIT_SELL'
+                        : null;
     return {
         action,
         decisionTimestamp:
@@ -1416,6 +1421,60 @@ function normalizeExecutionFillsResponse(payload: any): BinanceExecutionFillsRes
     };
 }
 
+function normalizeBithumbExecutionFillsResponse(payload: any): BithumbExecutionFillsResponse {
+    if (
+        !payload ||
+        toFiniteNumber(payload?.timestamp) === null ||
+        typeof payload?.symbol !== 'string' ||
+        !Array.isArray(payload?.fills)
+    ) {
+        throw new Error('Invalid Bithumb execution fills payload');
+    }
+
+    const fills = payload.fills.map((fill: any) => ({
+        id: typeof fill?.id === 'string' ? fill.id : fill?.id == null ? null : String(fill.id),
+        orderId:
+            typeof fill?.orderId === 'string'
+                ? fill.orderId
+                : fill?.orderId == null
+                    ? null
+                    : String(fill.orderId),
+        timestamp: fill?.timestamp == null ? null : Number(fill.timestamp),
+        datetime: typeof fill?.datetime === 'string' ? fill.datetime : null,
+        side: typeof fill?.side === 'string' ? fill.side : null,
+        type: typeof fill?.type === 'string' ? fill.type : null,
+        amount: fill?.amount == null ? null : Number(fill.amount),
+        price: fill?.price == null ? null : Number(fill.price),
+        cost: fill?.cost == null ? null : Number(fill.cost),
+        fee:
+            fill?.fee && typeof fill.fee === 'object'
+                ? {
+                    currency: typeof fill.fee?.currency === 'string' ? fill.fee.currency : null,
+                    cost: fill.fee?.cost == null ? null : Number(fill.fee.cost),
+                    rate: fill.fee?.rate == null ? null : Number(fill.fee.rate),
+                }
+                : null,
+        realizedPnl: fill?.realizedPnl == null ? null : Number(fill.realizedPnl),
+        maker: typeof fill?.maker === 'boolean' ? fill.maker : null,
+        takerOrMaker:
+            typeof fill?.takerOrMaker === 'string' ? fill.takerOrMaker : null,
+        strategyContext: normalizeExecutionStrategyContext(fill?.strategyContext),
+    }));
+
+    return {
+        timestamp: Number(payload.timestamp),
+        marketType: 'spot',
+        symbol: payload.symbol,
+        testnet: false,
+        safety: normalizeExecutionSafetySummary(payload?.safety),
+        limit: Number(payload.limit ?? 0),
+        since: payload?.since == null ? null : Number(payload.since),
+        count: Number(payload.count ?? fills.length),
+        fills,
+        error: typeof payload?.error === 'string' ? payload.error : undefined,
+    };
+}
+
 function normalizeExecutionEventsResponse(payload: any): ExecutionEventsResponse {
     if (
         !payload ||
@@ -1592,8 +1651,17 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
                 ? 'sell'
                 : null;
 
-    const orderBalancePct =
-        toFiniteNumber(enginePayload?.orderBalancePct ?? enginePayload?.amount) ?? 0;
+    const legacyPct = toFiniteNumber(enginePayload?.orderBalancePct ?? enginePayload?.amount);
+    const orderBalancePctEntryRaw = toFiniteNumber(
+        enginePayload?.orderBalancePctEntry ?? legacyPct
+    );
+    const orderBalancePctExitRaw = toFiniteNumber(
+        enginePayload?.orderBalancePctExit ?? legacyPct ?? orderBalancePctEntryRaw
+    );
+    const orderBalancePctEntry = Number.isFinite(orderBalancePctEntryRaw) ? orderBalancePctEntryRaw : 0;
+    const orderBalancePctExit = Number.isFinite(orderBalancePctExitRaw)
+        ? orderBalancePctExitRaw
+        : orderBalancePctEntry;
     const lastOrderAmount =
         toFiniteNumber(enginePayload?.lastOrderAmount) ?? null;
 
@@ -1605,7 +1673,8 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
             busy: Boolean(enginePayload.busy),
             marketType: normalizeExecutionMarketType(enginePayload.marketType),
             symbol: typeof enginePayload?.symbol === 'string' ? enginePayload.symbol : '',
-            orderBalancePct,
+            orderBalancePctEntry,
+            orderBalancePctExit,
             dryRun: Boolean(enginePayload?.dryRun),
             premiumBasis,
             entryThreshold: Number(enginePayload?.entryThreshold ?? 0),
@@ -1812,6 +1881,23 @@ export const fetchExecutionFills = async (options: {
         `/api/execution/binance/fills?${params.toString()}`,
         'Execution fills API',
         normalizeExecutionFillsResponse
+    );
+};
+
+export const fetchBithumbExecutionFills = async (options: {
+    symbol?: string;
+    limit?: number;
+    since?: number | null;
+} = {}): Promise<BithumbExecutionFillsResponse> => {
+    const params = new URLSearchParams();
+    if (options.symbol && options.symbol.trim()) params.set('symbol', options.symbol.trim());
+    params.set('limit', String(options.limit ?? 20));
+    if (Number.isFinite(options.since ?? NaN)) params.set('since', String(options.since));
+
+    return await fetchApi(
+        `/api/execution/bithumb/fills?${params.toString()}`,
+        'Bithumb execution fills API',
+        normalizeBithumbExecutionFillsResponse
     );
 };
 
