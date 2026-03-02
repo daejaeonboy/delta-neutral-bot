@@ -250,12 +250,18 @@ const discordConfigStateFile = path.join(runtimeStateDir, 'discord-config.json')
 const frontendDistDir = path.resolve(process.cwd(), 'dist');
 const frontendIndexFile = path.join(frontendDistDir, 'index.html');
 const runtimeEvents = [];
+const executionEventStreamClients = new Map();
+let executionEventStreamClientSeq = 0;
+let executionEventStreamHeartbeatTimer = null;
+const EXECUTION_EVENT_STREAM_HEARTBEAT_MS = 15_000;
 const premiumHistoryDir = path.resolve(process.cwd(), 'data', 'premium-history');
 const premiumHistoryByInterval = new Map();
 const premiumHistoryUpdatedAtByInterval = new Map();
 const usdKrwDailyRateCache = new Map();
 let binanceExecutionClient = null;
 let binanceExecutionClientCacheKey = null;
+let binanceSpotExecutionClient = null;
+let binanceSpotExecutionClientCacheKey = null;
 let runtimeBinanceExecutionApiKey = '';
 let runtimeBinanceExecutionApiSecret = '';
 let runtimeBinanceExecutionCredentialsUpdatedAt = null;
@@ -275,6 +281,8 @@ const executionIdempotencyStore = new Map();
 const executionAuthSessions = new Map();
 const executionAuthCookieName = 'execution_auth';
 let executionEngineSessionId = null;
+const executionEngineHedgeBreakConfirmTicks = 4;
+let executionEngineHedgeBreakMissingTicks = 0;
 const executionFailureState = {
     consecutiveFailures: 0,
     safeMode: false,
@@ -289,6 +297,9 @@ const executionEngineState = {
     busy: false,
     marketType: binanceExecutionMarketType,
     symbol: defaultExecutionSymbolByMarketType(binanceExecutionMarketType),
+    binanceEntrySide: 'short',
+    binanceLeverage: 4,
+    binanceMarginMode: 'isolated',
     orderBalancePctEntry: 0,
     orderBalancePctExit: 0,
     dryRun: true,
@@ -914,6 +925,91 @@ function isExecutionEventFeedItem(event) {
     );
 }
 
+function parseExecutionEventFilters(query = {}) {
+    const onlyFailures = parseBoolean(query.onlyFailures, false);
+    const levelFilter = typeof query.level === 'string' ? query.level.trim().toLowerCase() : '';
+    const rawMarketType =
+        typeof query.marketType === 'string' ? query.marketType.trim().toLowerCase() : '';
+    const marketTypeFilter = rawMarketType === 'coinm' || rawMarketType === 'usdm' ? rawMarketType : null;
+    return {
+        onlyFailures,
+        levelFilter: levelFilter || null,
+        marketTypeFilter,
+    };
+}
+
+function matchesExecutionEventFilters(entry, filters) {
+    if (filters.levelFilter) {
+        const level = typeof entry?.level === 'string' ? entry.level.toLowerCase() : '';
+        if (level !== filters.levelFilter) return false;
+    }
+
+    if (filters.onlyFailures) {
+        const isFailure =
+            entry?.level === 'error' ||
+            (typeof entry?.event === 'string' && entry.event.endsWith('_failure'));
+        if (!isFailure) return false;
+    }
+
+    if (filters.marketTypeFilter) {
+        if (entry?.marketType !== filters.marketTypeFilter) return false;
+    }
+
+    return true;
+}
+
+function stopExecutionEventStreamHeartbeatIfIdle() {
+    if (executionEventStreamClients.size > 0) return;
+    if (executionEventStreamHeartbeatTimer) {
+        clearInterval(executionEventStreamHeartbeatTimer);
+        executionEventStreamHeartbeatTimer = null;
+    }
+}
+
+function removeExecutionEventStreamClient(clientId) {
+    const client = executionEventStreamClients.get(clientId);
+    if (!client) return;
+    executionEventStreamClients.delete(clientId);
+    try {
+        client.res.end();
+    } catch {
+        // Ignore stream close errors.
+    }
+    stopExecutionEventStreamHeartbeatIfIdle();
+}
+
+function ensureExecutionEventStreamHeartbeat() {
+    if (executionEventStreamHeartbeatTimer) return;
+    executionEventStreamHeartbeatTimer = setInterval(() => {
+        for (const [clientId, client] of executionEventStreamClients.entries()) {
+            try {
+                client.res.write(': ping\n\n');
+            } catch {
+                removeExecutionEventStreamClient(clientId);
+            }
+        }
+        stopExecutionEventStreamHeartbeatIfIdle();
+    }, EXECUTION_EVENT_STREAM_HEARTBEAT_MS);
+}
+
+function publishExecutionEventToStreams(entry) {
+    if (!isExecutionEventFeedItem(entry?.event)) return;
+    if (executionEventStreamClients.size === 0) return;
+
+    const payload = JSON.stringify(entry);
+    for (const [clientId, client] of executionEventStreamClients.entries()) {
+        if (!matchesExecutionEventFilters(entry, client.filters)) {
+            continue;
+        }
+        try {
+            client.res.write(`id: ${entry.timestamp ?? Date.now()}\n`);
+            client.res.write(`data: ${payload}\n\n`);
+        } catch {
+            removeExecutionEventStreamClient(clientId);
+        }
+    }
+}
+
 function updateExecutionFailureState(level, event, details = {}) {
     if (!isExecutionRuntimeEvent(event)) return;
 
@@ -1056,6 +1152,7 @@ function recordRuntimeEvent(level, event, details = {}) {
         console.error(`Failed to append runtime event log: ${toErrorMessage(error)}`);
     }
 
+    publishExecutionEventToStreams(entry);
     updateExecutionFailureState(level, event, details);
     void sendExecutionAlert(entry);
 }
@@ -1113,6 +1210,20 @@ function parseExecutionPositionSide(value) {
     const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
     if (['LONG', 'SHORT', 'BOTH'].includes(normalized)) return normalized;
     return null;
+}
+
+function parseExecutionMarginMode(value) {
+    if (value === null || value === undefined) return null;
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (normalized === 'isolated' || normalized === 'cross') return normalized;
+    return null;
+}
+
+function parseExecutionEngineEntrySide(value, fallback = 'short') {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    if (normalized === 'long') return 'long';
+    if (normalized === 'short') return 'short';
+    return fallback === 'long' ? 'long' : 'short';
 }
 
 function parseExecutionStrategyAction(value) {
@@ -1243,24 +1354,33 @@ function buildExecutionOrderFingerprint({
     side,
     type,
     amount,
+    balancePct,
     price,
     reduceOnly,
     timeInForce,
     positionSide,
+    leverage,
+    marginMode,
     clientOrderId,
     dryRun,
 }) {
     const priceToken = Number.isFinite(price) ? round(price, 12) : null;
+    const leverageToken = Number.isFinite(leverage) ? Number(leverage) : null;
+    const amountToken = Number.isFinite(amount) ? round(amount, 12) : null;
+    const balancePctToken = Number.isFinite(balancePct) ? round(balancePct, 8) : null;
     return JSON.stringify({
         marketType,
         symbol,
         side,
         type,
-        amount: round(amount, 12),
+        amount: amountToken,
+        balancePct: balancePctToken,
         price: priceToken,
         reduceOnly: Boolean(reduceOnly),
         timeInForce: timeInForce ?? null,
         positionSide: positionSide ?? null,
+        leverage: leverageToken,
+        marginMode: marginMode ?? null,
         clientOrderId: clientOrderId ?? null,
         dryRun: Boolean(dryRun),
     });
@@ -1468,7 +1588,10 @@ function getActiveBithumbExecutionCredentials() {
 function clearExecutionClientCaches() {
     binanceExecutionClient = null;
     binanceExecutionClientCacheKey = null;
+    binanceSpotExecutionClient = null;
+    binanceSpotExecutionClientCacheKey = null;
     bithumbClient = null;
+    bithumbClientCacheKey = null;
 }
 
 function persistRuntimeExecutionCredentials(reason = 'update') {
@@ -1972,6 +2095,37 @@ function requireExecutionAdminAuth(req, res, next) {
     });
 }
 
+function requireExecutionEventStreamAuth(req, res, next) {
+    if (!isExecutionApiAuthEnabled()) {
+        next();
+        return;
+    }
+
+    if (req.method === 'OPTIONS') {
+        next();
+        return;
+    }
+
+    const queryToken = parseOptionalString(req.query?.adminToken, 512);
+    const token = extractExecutionAdminToken(req) ?? queryToken;
+    if (isExecutionAdminAuthEnabled() && token && token === executionAdminToken) {
+        next();
+        return;
+    }
+
+    const session = getExecutionAuthSessionFromRequest(req);
+    if (isExecutionPasswordAuthEnabled() && session) {
+        next();
+        return;
+    }
+
+    res.status(401).json({
+        error: 'Unauthorized execution API access',
+        code: 'execution_admin_auth_required',
+        timestamp: Date.now(),
+    });
+}
+
 function isExecutionEngineLeaderReplica() {
     if (!executionEngineLeaderReplicaId) return true;
     if (!railwayReplicaId) return false;
@@ -1985,6 +2139,9 @@ function getExecutionEngineSnapshot() {
         busy: executionEngineState.busy,
         marketType: executionEngineState.marketType,
         symbol: executionEngineState.symbol,
+        binanceEntrySide: executionEngineState.binanceEntrySide,
+        binanceLeverage: executionEngineState.binanceLeverage,
+        binanceMarginMode: executionEngineState.binanceMarginMode,
         orderBalancePctEntry: round(executionEngineState.orderBalancePctEntry, 4),
         orderBalancePctExit: round(executionEngineState.orderBalancePctExit, 4),
         dryRun: executionEngineState.dryRun,
@@ -2041,6 +2198,15 @@ function restoreExecutionEngineStateFromDisk() {
 
         executionEngineState.marketType = normalizeExecutionMarketType(engine.marketType);
         executionEngineState.symbol = parseExecutionSymbol(engine.symbol, executionEngineState.marketType);
+        executionEngineState.binanceEntrySide = parseExecutionEngineEntrySide(
+            engine.binanceEntrySide,
+            executionEngineState.binanceEntrySide
+        );
+        executionEngineState.binanceLeverage = Math.floor(
+            parseNumber(engine.binanceLeverage, executionEngineState.binanceLeverage, 1, 125)
+        );
+        executionEngineState.binanceMarginMode =
+            parseExecutionMarginMode(engine.binanceMarginMode) ?? executionEngineState.binanceMarginMode;
         const rawEntryPct = toFiniteNumber(engine.orderBalancePctEntry);
         const rawExitPct = toFiniteNumber(engine.orderBalancePctExit);
         const legacyPct = toFiniteNumber(engine.orderBalancePct ?? engine.amount);
@@ -2117,6 +2283,9 @@ function restoreExecutionEngineStateFromDisk() {
             desiredRunning: executionEngineState.desiredRunning,
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
+            binanceEntrySide: executionEngineState.binanceEntrySide,
+            binanceLeverage: executionEngineState.binanceLeverage,
+            binanceMarginMode: executionEngineState.binanceMarginMode,
             dryRun: executionEngineState.dryRun,
             premiumBasis: executionEngineState.premiumBasis,
             orderBalancePctEntry: round(executionEngineState.orderBalancePctEntry, 4),
@@ -2144,6 +2313,7 @@ function stopExecutionEngine(reason = 'manual-stop') {
     executionEngineState.running = false;
     executionEngineState.desiredRunning = false;
     executionEngineState.busy = false;
+    executionEngineHedgeBreakMissingTicks = 0;
     executionEngineState.stoppedAt = Date.now();
     executionEngineState.stopReason = reason;
     clearExecutionEngineTimer();
@@ -2197,9 +2367,12 @@ async function fetchExecutionEngineMarketSnapshot() {
         timestamp: Date.now(),
         krwPrice: round(krwPrice, 0),
         usdPrice: round(usdPrice, 2),
+        globalSource: globalTicker.source,
         exchangeRate: round(exchangeRate, 4),
+        fxSource: fxRate.source,
         usdtKrwRate: round(usdtKrwRate, 4),
         usdtConversionRate: round(usdtConversionRate, 4),
+        normalizedGlobalKrwPrice: round(normalizedGlobalKrwPrice, 0),
         kimchiPremiumPercent: round(kimchiPremiumPercent, 6),
         kimchiPremiumPercentUsdt: round(kimchiPremiumPercentUsdt, 6),
     };
@@ -2236,11 +2409,23 @@ function buildDiscordMarketCoreFields(snapshot, options = {}) {
     if (Number.isFinite(toFiniteNumber(snapshot.krwPrice))) {
         fields.push({ name: '국내 비트코인', value: `₩${Math.round(Number(snapshot.krwPrice)).toLocaleString()}` });
     }
+    if (Number.isFinite(toFiniteNumber(snapshot.normalizedGlobalKrwPrice))) {
+        fields.push({
+            name: '해외 비트코인(KRW 환산)',
+            value: `₩${Math.round(Number(snapshot.normalizedGlobalKrwPrice)).toLocaleString()}`,
+        });
+    }
     if (Number.isFinite(toFiniteNumber(snapshot.usdPrice))) {
-        fields.push({ name: '해외 비트코인', value: `$${round(Number(snapshot.usdPrice), 2).toLocaleString()}` });
+        fields.push({ name: '해외 비트코인(USD)', value: `$${round(Number(snapshot.usdPrice), 2).toLocaleString()}` });
+    }
+    if (typeof snapshot.globalSource === 'string' && snapshot.globalSource.trim()) {
+        fields.push({ name: '해외 시세 소스', value: snapshot.globalSource.trim() });
     }
     if (Number.isFinite(toFiniteNumber(snapshot.exchangeRate))) {
         fields.push({ name: 'USD/KRW', value: `₩${round(Number(snapshot.exchangeRate), 4).toLocaleString()}` });
+    }
+    if (typeof snapshot.fxSource === 'string' && snapshot.fxSource.trim()) {
+        fields.push({ name: '환율 소스', value: snapshot.fxSource.trim() });
     }
     if (Number.isFinite(toFiniteNumber(snapshot.usdtKrwRate))) {
         fields.push({ name: 'USDT/KRW', value: `₩${round(Number(snapshot.usdtKrwRate), 4).toLocaleString()}` });
@@ -2276,12 +2461,21 @@ function extractPositionSideToken(position) {
     );
 }
 
-function resolveShortPositionSnapshot(positions, symbol) {
+function resolveDirectionalPositionSnapshot(positions, symbol, targetSide = 'short') {
+    const resolvedTargetSide = targetSide === 'long' ? 'long' : 'short';
     if (!Array.isArray(positions)) {
-        return { shortContracts: 0, hedgeModeDetected: false, hadPositions: false };
+        return {
+            targetContracts: 0,
+            shortContracts: 0,
+            longContracts: 0,
+            hedgeModeDetected: false,
+            hadPositions: false,
+        };
     }
 
+    let targetContracts = 0;
     let shortContracts = 0;
+    let longContracts = 0;
     let hedgeModeDetected = false;
     let hadPositions = false;
 
@@ -2305,21 +2499,28 @@ function resolveShortPositionSnapshot(positions, symbol) {
 
         if (quantity <= 0) continue;
 
-        let isShort = false;
+        let direction = null;
         if (sideToken === 'SHORT') {
-            isShort = true;
+            direction = 'short';
         } else if (sideToken === 'LONG') {
-            isShort = false;
+            direction = 'long';
         } else if (Number.isFinite(positionAmt)) {
-            isShort = positionAmt < 0;
+            direction = positionAmt < 0 ? 'short' : 'long';
         } else {
             continue;
         }
 
-        if (isShort) shortContracts += quantity;
+        if (direction === 'short') {
+            shortContracts += quantity;
+        } else {
+            longContracts += quantity;
+        }
+        if (direction === resolvedTargetSide) {
+            targetContracts += quantity;
+        }
     }
 
-    return { shortContracts, hedgeModeDetected, hadPositions };
+    return { targetContracts, shortContracts, longContracts, hedgeModeDetected, hadPositions };
 }
 
 function isPositionSideMismatchError(message) {
@@ -2335,11 +2536,15 @@ async function syncExecutionEnginePositionState() {
 
     const client = await getBinanceExecutionClient(executionEngineState.marketType, true);
     const positions = await client.fetchPositions([executionEngineState.symbol]);
-    const snapshot = resolveShortPositionSnapshot(positions, executionEngineState.symbol);
+    const snapshot = resolveDirectionalPositionSnapshot(
+        positions,
+        executionEngineState.symbol,
+        executionEngineState.binanceEntrySide
+    );
     if (snapshot.hadPositions) {
         executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
     }
-    const hasPosition = snapshot.shortContracts > 1e-12;
+    const hasPosition = snapshot.targetContracts > 1e-12;
 
     executionEngineState.positionState = hasPosition ? 'ENTERED' : 'IDLE';
     return executionEngineState.positionState;
@@ -2349,6 +2554,14 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
     const url = `http://127.0.0.1:${port}/api/execution/binance/order`;
     const allowInSafeMode = Boolean(options.allowInSafeMode);
     const idempotencyKeyPrefix = options.idempotencyKeyPrefix ?? 'engine';
+    const reduceOnly = Boolean(options.reduceOnly);
+    const strategyAction =
+        parseExecutionStrategyAction(options.strategyAction) ??
+        (side === 'sell' ? 'ENTRY_SELL' : 'EXIT_BUY');
+    const positionSideHint =
+        options.positionSideHint === 'LONG' || options.positionSideHint === 'SHORT'
+            ? options.positionSideHint
+            : null;
 
     const requestExecutionOrder = async (positionSide) => {
         const idempotencyKey = `${idempotencyKeyPrefix}-${side}-${marketSnapshot.timestamp}-${Math.random().toString(36).slice(2, 10)}`;
@@ -2359,9 +2572,11 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
             type: 'market',
             amount: orderAmount,
             dryRun: executionEngineState.dryRun,
-            reduceOnly: side === 'buy',
+            reduceOnly,
+            leverage: executionEngineState.binanceLeverage,
+            marginMode: executionEngineState.binanceMarginMode,
             strategyContext: {
-                action: side === 'sell' ? 'ENTRY_SELL' : 'EXIT_BUY',
+                action: strategyAction,
                 decisionTimestamp: marketSnapshot.timestamp,
                 premiumPct: marketSnapshot.kimchiPremiumPercent,
                 effectivePremiumPct: premiumValue,
@@ -2417,7 +2632,8 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
         return payload;
     };
 
-    const preferredPositionSide = executionEngineState.positionSideMode === 'HEDGE' ? 'SHORT' : null;
+    const preferredPositionSide =
+        executionEngineState.positionSideMode === 'HEDGE' ? positionSideHint : null;
 
     try {
         const payload = await requestExecutionOrder(preferredPositionSide);
@@ -2426,7 +2642,7 @@ async function placeExecutionEngineOrder(side, orderAmount, marketSnapshot, prem
     } catch (error) {
         const message = toErrorMessage(error);
         if (isPositionSideMismatchError(message)) {
-            const fallbackPositionSide = preferredPositionSide ? null : 'SHORT';
+            const fallbackPositionSide = preferredPositionSide ? null : positionSideHint;
             if (fallbackPositionSide !== preferredPositionSide) {
                 const payload = await requestExecutionOrder(fallbackPositionSide);
                 executionEngineState.positionSideMode = fallbackPositionSide ? 'HEDGE' : 'ONEWAY';
@@ -2527,6 +2743,137 @@ async function placeExecutionEngineBithumbOrder(
     return payload;
 }
 
+async function handleExecutionEngineHedgeBreakIfNeeded(marketSnapshot, premiumValue) {
+    if (executionEngineState.dryRun) {
+        executionEngineHedgeBreakMissingTicks = 0;
+        return false;
+    }
+
+    if (executionEngineState.positionState !== 'ENTERED') {
+        executionEngineHedgeBreakMissingTicks = 0;
+        return false;
+    }
+
+    const client = await getBinanceExecutionClient(executionEngineState.marketType, true);
+    const positions = await client.fetchPositions([executionEngineState.symbol]);
+    const snapshot = resolveDirectionalPositionSnapshot(
+        positions,
+        executionEngineState.symbol,
+        executionEngineState.binanceEntrySide
+    );
+    if (snapshot.hadPositions) {
+        executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
+    }
+
+    if (snapshot.targetContracts > 1e-12) {
+        executionEngineHedgeBreakMissingTicks = 0;
+        return false;
+    }
+
+    executionEngineHedgeBreakMissingTicks += 1;
+    recordRuntimeEvent('warn', 'execution_engine_hedge_break_candidate', {
+        marketType: executionEngineState.marketType,
+        symbol: executionEngineState.symbol,
+        expectedSide: executionEngineState.binanceEntrySide,
+        missingTicks: executionEngineHedgeBreakMissingTicks,
+        confirmTicks: executionEngineHedgeBreakConfirmTicks,
+        premiumValue: round(premiumValue, 6),
+    });
+
+    if (executionEngineHedgeBreakMissingTicks < executionEngineHedgeBreakConfirmTicks) {
+        return false;
+    }
+
+    executionEngineHedgeBreakMissingTicks = 0;
+
+    let closedSpotAmount = 0;
+    let spotOrderId = null;
+    let spotCloseAttempted = false;
+
+    try {
+        if (!hasBithumbExecutionCredentials()) {
+            throw new Error('BITHUMB_API_KEY/BITHUMB_API_SECRET is not configured');
+        }
+
+        const bithumbClient = await getBithumbExecutionClient(true);
+        const balance = await bithumbClient.fetchBalance();
+        const freeBtc = toFiniteNumber(balance?.BTC?.free ?? balance?.btc?.free);
+
+        if (Number.isFinite(freeBtc) && freeBtc > 1e-12) {
+            spotCloseAttempted = true;
+            closedSpotAmount = round(freeBtc, 8);
+            const closePayload = await placeExecutionEngineBithumbOrder(
+                'sell',
+                closedSpotAmount,
+                marketSnapshot,
+                premiumValue,
+                {
+                    strategyAction: 'EXIT_SELL',
+                    allowInSafeMode: true,
+                    idempotencyKeyPrefix: 'engine-hedge-break',
+                }
+            );
+            spotOrderId = closePayload?.order?.id ?? null;
+        }
+
+        executionEngineState.positionState = 'IDLE';
+        executionEngineState.lastOrderError = null;
+        executionEngineState.lastError = null;
+        persistExecutionEngineState('hedge-break-emergency-close');
+
+        recordRuntimeEvent('error', 'execution_engine_hedge_break_emergency_close', {
+            marketType: executionEngineState.marketType,
+            symbol: executionEngineState.symbol,
+            expectedSide: executionEngineState.binanceEntrySide,
+            premiumValue: round(premiumValue, 6),
+            spotCloseAttempted,
+            closedSpotAmount: closedSpotAmount > 0 ? closedSpotAmount : 0,
+            spotOrderId,
+        });
+
+        void sendDiscordNotification({
+            title: '🚨 바이낸스 헤지 붕괴 감지',
+            description: '바이낸스 선물 포지션이 사라져 빗썸 현물 포지션 정리를 시도했습니다.',
+            color: 0xf59e0b,
+            fields: [
+                { name: '심볼', value: executionEngineState.symbol },
+                { name: '예상 선물 방향', value: executionEngineState.binanceEntrySide.toUpperCase() },
+                { name: '현재 김프', value: `${round(premiumValue, 4)}%` },
+                { name: '빗썸 정리 수량', value: `${closedSpotAmount > 0 ? closedSpotAmount : 0} BTC` },
+                { name: '빗썸 주문ID', value: spotOrderId ?? 'N/A', inline: false },
+            ],
+        });
+    } catch (error) {
+        const message = toErrorMessage(error);
+        executionEngineState.lastError = message;
+        executionEngineState.lastOrderError = message;
+        persistExecutionEngineState('hedge-break-emergency-close-failed');
+
+        recordRuntimeEvent('error', 'execution_engine_hedge_break_emergency_close_failed', {
+            marketType: executionEngineState.marketType,
+            symbol: executionEngineState.symbol,
+            expectedSide: executionEngineState.binanceEntrySide,
+            premiumValue: round(premiumValue, 6),
+            error: message,
+        });
+
+        void sendDiscordNotification({
+            title: '🚨 바이낸스 헤지 붕괴 + 빗썸 정리 실패',
+            description: '헤지 붕괴 대응 중 빗썸 포지션 정리에 실패했습니다. 즉시 수동 확인이 필요합니다.',
+            color: 0xef4444,
+            fields: [
+                { name: '심볼', value: executionEngineState.symbol },
+                { name: '예상 선물 방향', value: executionEngineState.binanceEntrySide.toUpperCase() },
+                { name: '현재 김프', value: `${round(premiumValue, 4)}%` },
+                { name: '오류', value: message, inline: false },
+            ],
+        });
+    }
+
+    stopExecutionEngine('binance-hedge-break-protection');
+    return true;
+}
+
 function scheduleExecutionEngineTick(delayMs = executionEngineState.pollIntervalMs) {
     if (!executionEngineState.running) return;
     clearExecutionEngineTimer();
@@ -2579,6 +2926,14 @@ async function runExecutionEngineTick() {
             throw new Error('premium value is not available');
         }
 
+        const hedgeBreakHandled = await handleExecutionEngineHedgeBreakIfNeeded(
+            marketSnapshot,
+            premiumValue
+        );
+        if (hedgeBreakHandled) {
+            return;
+        }
+
         if (
             Number.isFinite(executionEngineState.lastOrderAt) &&
             Date.now() - executionEngineState.lastOrderAt < executionEngineState.orderCooldownMs
@@ -2592,16 +2947,35 @@ async function runExecutionEngineTick() {
         const positionState = executionEngineState.positionState;
 
         let action = null;
-        if (positionState === 'IDLE' && premiumValue >= entryThreshold) {
+        if (positionState === 'IDLE' && premiumValue <= entryThreshold) {
             action = 'ENTRY';
-        } else if (positionState === 'ENTERED' && premiumValue <= exitThreshold) {
+        } else if (positionState === 'ENTERED' && premiumValue >= exitThreshold) {
             action = 'EXIT';
         }
 
         if (!action) return;
 
-        const side = action === 'ENTRY' ? 'sell' : 'buy';
-        const bithumbSide = action === 'ENTRY' ? 'buy' : 'sell';
+        const binanceEntryOrderSide = executionEngineState.binanceEntrySide === 'long' ? 'buy' : 'sell';
+        const binanceExitOrderSide = binanceEntryOrderSide === 'buy' ? 'sell' : 'buy';
+        const side = action === 'ENTRY' ? binanceEntryOrderSide : binanceExitOrderSide;
+        const bithumbSide = side === 'buy' ? 'sell' : 'buy';
+        const binancePositionSide = executionEngineState.binanceEntrySide === 'long' ? 'LONG' : 'SHORT';
+        const strategyAction =
+            action === 'ENTRY'
+                ? side === 'sell'
+                    ? 'ENTRY_SELL'
+                    : 'ENTRY_BUY'
+                : side === 'buy'
+                    ? 'EXIT_BUY'
+                    : 'EXIT_SELL';
+        const bithumbStrategyAction =
+            action === 'ENTRY'
+                ? bithumbSide === 'buy'
+                    ? 'ENTRY_BUY'
+                    : 'ENTRY_SELL'
+                : bithumbSide === 'buy'
+                    ? 'EXIT_BUY'
+                    : 'EXIT_SELL';
         let orderAmount = 0;
         let spotOrderAmount = 0;
         let binanceClient = null;
@@ -2620,18 +2994,31 @@ async function runExecutionEngineTick() {
                 throw new Error(`order balance pct is invalid: ${rawPct}`);
             }
 
-            const computeEntryAmount = async (client, freeBalance) => {
+            const computeEntryAmount = async (client, freeBalance, requestedPctFactor = pctFactor) => {
                 if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
                     throw new Error('free balance is not available');
+                }
+                const sizingPct =
+                    Number.isFinite(requestedPctFactor) && requestedPctFactor > 0
+                        ? requestedPctFactor
+                        : NaN;
+                if (!Number.isFinite(sizingPct) || sizingPct <= 0) {
+                    throw new Error(`entry sizing pct is invalid: ${requestedPctFactor}`);
                 }
 
                 const price = toFiniteNumber(marketSnapshot.usdPrice);
                 if (!Number.isFinite(price) || price <= 0) {
                     throw new Error('BTC price is not available');
                 }
+                const leverageFactor =
+                    Number.isFinite(executionEngineState.binanceLeverage) &&
+                    executionEngineState.binanceLeverage > 0
+                        ? executionEngineState.binanceLeverage
+                        : 1;
 
                 if (executionEngineState.marketType === 'usdm') {
-                    return round((freeBalance * pctFactor) / price, 8);
+                    const notionalUsd = freeBalance * sizingPct * leverageFactor;
+                    return round(notionalUsd / price, 8);
                 }
 
                 const market = client && typeof client.market === 'function'
@@ -2639,11 +3026,12 @@ async function runExecutionEngineTick() {
                     : null;
                 const contractSize = toFiniteNumber(market?.contractSize);
                 if (market?.inverse && Number.isFinite(contractSize) && contractSize > 0) {
-                    const notionalUsd = freeBalance * pctFactor * price;
+                    const notionalUsd = freeBalance * sizingPct * price * leverageFactor;
                     return round(notionalUsd / contractSize, 8);
                 }
 
-                return round(freeBalance * pctFactor, 8);
+                const notionalUsd = freeBalance * sizingPct * leverageFactor;
+                return round(notionalUsd / price, 8);
             };
 
             if (!executionEngineState.dryRun) {
@@ -2652,21 +3040,28 @@ async function runExecutionEngineTick() {
                 if (action === 'ENTRY') {
                     const balance = await binanceClient.fetchBalance();
                     const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
-                    const freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
+                    const balanceSnapshot = resolveExecutionAssetBalance(balance, balanceAsset);
+                    const freeBalance = toFiniteNumber(balanceSnapshot.free);
                     if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
                         throw new Error(`Insufficient ${balanceAsset} balance (${freeBalance})`);
                     }
-                    orderAmount = await computeEntryAmount(binanceClient, freeBalance);
+                    orderAmount = await computeEntryAmount(binanceClient, freeBalance, 1);
                 } else {
                     const positions = await binanceClient.fetchPositions([executionEngineState.symbol]);
-                    const snapshot = resolveShortPositionSnapshot(positions, executionEngineState.symbol);
+                    const snapshot = resolveDirectionalPositionSnapshot(
+                        positions,
+                        executionEngineState.symbol,
+                        executionEngineState.binanceEntrySide
+                    );
                     if (snapshot.hadPositions) {
                         executionEngineState.positionSideMode = snapshot.hedgeModeDetected ? 'HEDGE' : 'ONEWAY';
                     }
-                    if (snapshot.shortContracts <= 0) {
-                        throw new Error(`No short position to close for ${executionEngineState.symbol}`);
+                    if (snapshot.targetContracts <= 0) {
+                        throw new Error(
+                            `No ${executionEngineState.binanceEntrySide} position to close for ${executionEngineState.symbol}`
+                        );
                     }
-                    orderAmount = round(snapshot.shortContracts * pctFactor, 8);
+                    orderAmount = round(snapshot.targetContracts * pctFactor, 8);
                 }
             } else {
                 let freeBalance = NaN;
@@ -2675,7 +3070,8 @@ async function runExecutionEngineTick() {
                         binanceClient = await getBinanceExecutionClient(executionEngineState.marketType, true);
                         const balance = await binanceClient.fetchBalance();
                         const balanceAsset = executionEngineState.marketType === 'usdm' ? 'USDT' : 'BTC';
-                        freeBalance = toFiniteNumber(balance?.[balanceAsset]?.free);
+                        const balanceSnapshot = resolveExecutionAssetBalance(balance, balanceAsset);
+                        freeBalance = toFiniteNumber(balanceSnapshot.free);
                     } catch {
                         binanceClient = null;
                         freeBalance = NaN;
@@ -2687,9 +3083,9 @@ async function runExecutionEngineTick() {
                 }
 
                 if (action === 'ENTRY') {
-                    orderAmount = await computeEntryAmount(binanceClient, freeBalance);
+                    orderAmount = await computeEntryAmount(binanceClient, freeBalance, 1);
                 } else if (
-                    executionEngineState.lastOrderSide === 'sell' &&
+                    executionEngineState.lastOrderSide === binanceEntryOrderSide &&
                     Number.isFinite(executionEngineState.lastOrderAmount)
                 ) {
                     orderAmount = round(executionEngineState.lastOrderAmount * pctFactor, 8);
@@ -2711,7 +3107,7 @@ async function runExecutionEngineTick() {
                 const bithumbClient = await getBithumbExecutionClient(true);
                 const balance = await bithumbClient.fetchBalance();
 
-                if (action === 'ENTRY') {
+                if (bithumbSide === 'buy') {
                     const freeKrw = toFiniteNumber(balance?.KRW?.free ?? balance?.krw?.free);
                     const krwPrice = toFiniteNumber(marketSnapshot.krwPrice);
                     if (!Number.isFinite(freeKrw) || freeKrw <= 0) {
@@ -2754,6 +3150,11 @@ async function runExecutionEngineTick() {
                 }
             }
 
+            if (action === 'ENTRY' && Number.isFinite(pctFactor) && pctFactor > 0 && pctFactor < 1) {
+                orderAmount = round(orderAmount * pctFactor, 8);
+                spotOrderAmount = round(spotOrderAmount * pctFactor, 8);
+            }
+
             if (!Number.isFinite(orderAmount) || orderAmount <= 0) {
                 throw new Error(`Calculated order amount is invalid: ${orderAmount}`);
             }
@@ -2777,18 +3178,27 @@ async function runExecutionEngineTick() {
                 spotOrderAmount,
                 marketSnapshot,
                 premiumValue,
-                { strategyAction: 'ENTRY_BUY' }
+                { strategyAction: bithumbStrategyAction }
             );
             try {
-                binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
+                binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue, {
+                    reduceOnly: false,
+                    strategyAction,
+                    positionSideHint: binancePositionSide,
+                });
             } catch (error) {
                 try {
                     await placeExecutionEngineBithumbOrder(
-                        'sell',
+                        bithumbSide === 'buy' ? 'sell' : 'buy',
                         spotOrderAmount,
                         marketSnapshot,
                         premiumValue,
-                        { strategyAction: 'EXIT_SELL', allowInSafeMode: true, idempotencyKeyPrefix: 'engine-rollback' }
+                        {
+                            strategyAction:
+                                bithumbSide === 'buy' ? 'EXIT_SELL' : 'EXIT_BUY',
+                            allowInSafeMode: true,
+                            idempotencyKeyPrefix: 'engine-rollback',
+                        }
                     );
                 } catch (rollbackError) {
                     recordRuntimeEvent('error', 'execution_engine_bithumb_rollback_failure', {
@@ -2799,21 +3209,35 @@ async function runExecutionEngineTick() {
                 throw error;
             }
         } else {
-            binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue);
+            binancePayload = await placeExecutionEngineOrder(side, orderAmount, marketSnapshot, premiumValue, {
+                reduceOnly: true,
+                strategyAction,
+                positionSideHint: binancePositionSide,
+            });
             try {
                 bithumbPayload = await placeExecutionEngineBithumbOrder(
                     bithumbSide,
                     spotOrderAmount,
                     marketSnapshot,
                     premiumValue,
-                    { strategyAction: 'EXIT_SELL' }
+                    { strategyAction: bithumbStrategyAction }
                 );
             } catch (error) {
                 try {
-                    await placeExecutionEngineOrder('sell', orderAmount, marketSnapshot, premiumValue, {
-                        allowInSafeMode: true,
-                        idempotencyKeyPrefix: 'engine-rollback',
-                    });
+                    await placeExecutionEngineOrder(
+                        binanceEntryOrderSide,
+                        orderAmount,
+                        marketSnapshot,
+                        premiumValue,
+                        {
+                            allowInSafeMode: true,
+                            idempotencyKeyPrefix: 'engine-rollback',
+                            reduceOnly: false,
+                            strategyAction:
+                                binanceEntryOrderSide === 'sell' ? 'ENTRY_SELL' : 'ENTRY_BUY',
+                            positionSideHint: binancePositionSide,
+                        }
+                    );
                 } catch (rollbackError) {
                     recordRuntimeEvent('error', 'execution_engine_binance_rollback_failure', {
                         action,
@@ -2855,10 +3279,20 @@ async function runExecutionEngineTick() {
             includePremium: false,
             includeUsdtPremium: false,
         });
+        const entryDirectionLabel =
+            executionEngineState.binanceEntrySide === 'long' ? '롱' : '숏';
         void sendDiscordNotification({
-            title: action === 'ENTRY' ? '🔴 숏 진입 (ENTRY)' : '🟢 포지션 청산 (EXIT)',
+            title:
+                action === 'ENTRY'
+                    ? `${executionEngineState.binanceEntrySide === 'long' ? '🟢' : '🔴'} ${entryDirectionLabel} 진입 (ENTRY)`
+                    : '🟢 포지션 청산 (EXIT)',
             description: `${executionEngineState.symbol} ${side.toUpperCase()} · 김프 ${round(premiumValue, 2)}% 도달 (기준: ${action === 'ENTRY' ? entryThreshold : exitThreshold}%)`,
-            color: action === 'ENTRY' ? 0xef4444 : 0x10b981,
+            color:
+                action === 'ENTRY'
+                    ? executionEngineState.binanceEntrySide === 'long'
+                        ? 0x10b981
+                        : 0xef4444
+                    : 0x3b82f6,
             fields: [
                 { name: '김프', value: `${round(premiumValue, 4)}%` },
                 { name: '기준가', value: `${action === 'ENTRY' ? entryThreshold : exitThreshold}%` },
@@ -2896,6 +3330,9 @@ async function runExecutionEngineTick() {
 async function startExecutionEngine({
     marketType,
     symbol,
+    binanceEntrySide,
+    binanceLeverage,
+    binanceMarginMode,
     orderBalancePctEntry,
     orderBalancePctExit,
     dryRun,
@@ -2951,12 +3388,25 @@ async function startExecutionEngine({
     if (!Number.isFinite(resolvedEntryThreshold) || !Number.isFinite(resolvedExitThreshold)) {
         throw new Error('entryThreshold and exitThreshold are required');
     }
-    if (resolvedEntryThreshold <= resolvedExitThreshold) {
-        throw new Error('entryThreshold must be greater than exitThreshold');
+    if (resolvedEntryThreshold >= resolvedExitThreshold) {
+        throw new Error('entryThreshold must be less than exitThreshold');
     }
+
+    const resolvedBinanceEntrySide = parseExecutionEngineEntrySide(
+        binanceEntrySide,
+        executionEngineState.binanceEntrySide
+    );
+    const resolvedBinanceLeverage = Math.floor(
+        parseNumber(binanceLeverage, executionEngineState.binanceLeverage, 1, 125)
+    );
+    const resolvedBinanceMarginMode =
+        parseExecutionMarginMode(binanceMarginMode) ?? executionEngineState.binanceMarginMode;
 
     executionEngineState.marketType = normalizeExecutionMarketType(marketType);
     executionEngineState.symbol = parseExecutionSymbol(symbol, executionEngineState.marketType);
+    executionEngineState.binanceEntrySide = resolvedBinanceEntrySide;
+    executionEngineState.binanceLeverage = resolvedBinanceLeverage;
+    executionEngineState.binanceMarginMode = resolvedBinanceMarginMode;
     executionEngineState.orderBalancePctEntry = resolvedOrderBalancePctEntry;
     executionEngineState.orderBalancePctExit = resolvedOrderBalancePctExit;
     executionEngineState.dryRun = resolvedDryRun;
@@ -2983,6 +3433,7 @@ async function startExecutionEngine({
     executionEngineState.lastOrderError = null;
     executionEngineState.stopReason = null;
     executionEngineState.desiredRunning = true;
+    executionEngineHedgeBreakMissingTicks = 0;
     clearExecutionEngineTimer();
     persistExecutionEngineState('start-initialized');
 
@@ -3005,6 +3456,9 @@ async function startExecutionEngine({
     recordRuntimeEvent('info', 'execution_engine_started', {
         marketType: executionEngineState.marketType,
         symbol: executionEngineState.symbol,
+        binanceEntrySide: executionEngineState.binanceEntrySide,
+        binanceLeverage: executionEngineState.binanceLeverage,
+        binanceMarginMode: executionEngineState.binanceMarginMode,
         dryRun: executionEngineState.dryRun,
         premiumBasis: executionEngineState.premiumBasis,
         orderBalancePctEntry: executionEngineState.orderBalancePctEntry,
@@ -3021,6 +3475,12 @@ async function startExecutionEngine({
         color: 0x3b82f6,
         fields: [
             { name: '마켓', value: executionEngineState.marketType },
+            {
+                name: '진입방향',
+                value: executionEngineState.binanceEntrySide === 'long' ? 'LONG' : 'SHORT',
+            },
+            { name: '배율', value: `${executionEngineState.binanceLeverage}x` },
+            { name: '마진', value: executionEngineState.binanceMarginMode.toUpperCase() },
             { name: 'DryRun', value: executionEngineState.dryRun ? '✅' : '❌' },
             ...startMarketFields,
         ],
@@ -3084,6 +3544,48 @@ async function getBinanceExecutionClient(marketType, requireCredentials = true) 
 
     binanceExecutionClient = client;
     binanceExecutionClientCacheKey = cacheKey;
+    return client;
+}
+
+async function getBinanceSpotExecutionClient(requireCredentials = true) {
+    const activeCredentials = getActiveBinanceExecutionCredentials();
+    const hasCredentials = activeCredentials.configured;
+
+    if (requireCredentials && !hasCredentials) {
+        throw new Error('BINANCE_API_KEY/BINANCE_API_SECRET is not configured');
+    }
+
+    const credentialToken = hasCredentials
+        ? `${activeCredentials.source}:${activeCredentials.keyHint ?? 'unknown'}`
+        : 'none';
+    const cacheKey = `spot:${binanceExecutionTestnet ? 'testnet' : 'mainnet'}:${hasCredentials ? 'auth' : 'public'}:${credentialToken}`;
+    if (binanceSpotExecutionClient && binanceSpotExecutionClientCacheKey === cacheKey) {
+        return binanceSpotExecutionClient;
+    }
+
+    const client = new ccxt.binance({
+        apiKey: hasCredentials ? activeCredentials.apiKey : undefined,
+        secret: hasCredentials ? activeCredentials.apiSecret : undefined,
+        enableRateLimit: true,
+        options: {
+            recvWindow: binanceRecvWindowMs,
+        },
+    });
+
+    if (binanceExecutionTestnet) {
+        if (typeof client.enableDemoTrading === 'function') {
+            client.enableDemoTrading(true);
+        } else if (typeof client.setSandboxMode === 'function') {
+            client.setSandboxMode(true);
+        }
+    } else if (typeof client.enableDemoTrading === 'function') {
+        client.enableDemoTrading(false);
+    }
+
+    await client.loadMarkets();
+
+    binanceSpotExecutionClient = client;
+    binanceSpotExecutionClientCacheKey = cacheKey;
     return client;
 }
 
@@ -3317,6 +3819,15 @@ async function fetchUsdKrwFromFrankfurter() {
     return { rate, source: 'frankfurter:USD/KRW' };
 }
 
+async function fetchUsdKrwFromCoinbase() {
+    const data = await fetchJson('https://api.coinbase.com/v2/exchange-rates?currency=USD');
+    const rate = toFiniteNumber(data?.data?.rates?.KRW);
+    if (!Number.isFinite(rate) || rate <= 0) {
+        throw new Error('Invalid KRW rate from coinbase');
+    }
+    return { rate, source: 'coinbase:USD/KRW' };
+}
+
 async function getUsdKrwRate() {
     const now = Date.now();
 
@@ -3324,7 +3835,7 @@ async function getUsdKrwRate() {
         return fxCache;
     }
 
-    const providers = [fetchUsdKrwFromErApi, fetchUsdKrwFromFrankfurter];
+    const providers = [fetchUsdKrwFromCoinbase, fetchUsdKrwFromErApi, fetchUsdKrwFromFrankfurter];
     for (const provider of providers) {
         try {
             const { rate, source } = await provider();
@@ -3405,12 +3916,27 @@ async function fetchBinanceCoinMBtcUsd() {
     return price;
 }
 
-async function fetchBinanceBtcUsdt() {
-    const data = await fetchJson('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+async function fetchBinanceUsdmBtcUsdt() {
+    const data = await fetchJson('https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT', {
+        context: 'binance-usdm-btc',
+    });
     const btcUsdt = toFiniteNumber(data?.price);
 
     if (!Number.isFinite(btcUsdt) || btcUsdt <= 0) {
-        throw new Error('Invalid BTCUSDT price from Binance');
+        throw new Error('Invalid BTCUSDT price from Binance USDT-M');
+    }
+
+    return btcUsdt;
+}
+
+async function fetchBinanceBtcUsdt() {
+    const data = await fetchJson('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', {
+        context: 'binance-spot-btc',
+    });
+    const btcUsdt = toFiniteNumber(data?.price);
+
+    if (!Number.isFinite(btcUsdt) || btcUsdt <= 0) {
+        throw new Error('Invalid BTCUSDT price from Binance Spot');
     }
 
     return btcUsdt;
@@ -3821,11 +4347,12 @@ async function fetchBybitCandles({ interval, limit }) {
 
 async function fetchGlobalBtcUsdt() {
     const providers = [
-        { source: 'binance:COIN-M', fetcher: fetchBinanceCoinMBtcUsd },
-        { source: 'binance:BTCUSDT', fetcher: fetchBinanceBtcUsdt },
+        { source: 'binance:USDT-M', fetcher: fetchBinanceUsdmBtcUsdt },
+        { source: 'binance:spot', fetcher: fetchBinanceBtcUsdt },
         { source: 'bybit:BTCUSDT', fetcher: fetchBybitBtcUsdt },
         { source: 'kraken:BTCUSDT', fetcher: fetchKrakenBtcUsdt },
         { source: 'okx:BTCUSDT', fetcher: fetchOkxBtcUsdt },
+        { source: 'binance:COIN-M', fetcher: fetchBinanceCoinMBtcUsd },
         { source: 'coingecko:BTC/USD', fetcher: fetchCoinGeckoBtcUsdt },
     ];
 
@@ -4872,14 +5399,14 @@ app.get('/api/backtest/premium', async (req, res) => {
             return;
         }
 
-        if (entryThreshold <= exitThreshold) {
+        if (entryThreshold >= exitThreshold) {
             recordRuntimeEvent('warn', 'api_backtest_premium_validation_failed', {
                 durationMs: Date.now() - startedAt,
                 entryThreshold,
                 exitThreshold,
             });
             res.status(400).json({
-                error: 'entryThreshold must be greater than exitThreshold',
+                error: 'entryThreshold must be less than exitThreshold',
             });
             return;
         }
@@ -5378,7 +5905,7 @@ app.get('/api/multi-premium', async (req, res) => {
     }
 });
 
-function normalizeExecutionWalletBalances(balance, balanceLimit = 8) {
+function getExecutionBalanceMaps(balance) {
     const totalMap =
         balance?.total && typeof balance.total === 'object'
             ? balance.total
@@ -5391,6 +5918,59 @@ function normalizeExecutionWalletBalances(balance, balanceLimit = 8) {
         balance?.used && typeof balance.used === 'object'
             ? balance.used
             : {};
+
+    return { totalMap, freeMap, usedMap };
+}
+
+function resolveExecutionAssetBalance(balance, asset) {
+    const resolvedAsset = typeof asset === 'string' ? asset.trim().toUpperCase() : '';
+    const { totalMap, freeMap, usedMap } = getExecutionBalanceMaps(balance);
+    const direct = resolvedAsset ? balance?.[resolvedAsset] : null;
+    const directFree = toFiniteNumber(direct?.free);
+    const directUsed = toFiniteNumber(direct?.used);
+    const directTotal = toFiniteNumber(direct?.total);
+    const mapFree = resolvedAsset ? toFiniteNumber(freeMap?.[resolvedAsset]) : NaN;
+    const mapUsed = resolvedAsset ? toFiniteNumber(usedMap?.[resolvedAsset]) : NaN;
+    const mapTotal = resolvedAsset ? toFiniteNumber(totalMap?.[resolvedAsset]) : NaN;
+
+    return {
+        asset: resolvedAsset || null,
+        free: Number.isFinite(directFree) ? directFree : mapFree,
+        used: Number.isFinite(directUsed) ? directUsed : mapUsed,
+        total: Number.isFinite(directTotal) ? directTotal : mapTotal,
+    };
+}
+
+function ensureExecutionBalanceAssetRow(rows, assetBalance, balanceLimit = 8) {
+    if (!Array.isArray(rows)) return [];
+    const resolvedAsset = typeof assetBalance?.asset === 'string' ? assetBalance.asset : null;
+    if (!resolvedAsset) return rows.slice(0, balanceLimit);
+
+    const existing = rows.find(
+        (row) => typeof row?.asset === 'string' && row.asset.toUpperCase() === resolvedAsset
+    );
+    if (existing) return rows.slice(0, balanceLimit);
+
+    const free = toFiniteNumber(assetBalance?.free);
+    const used = toFiniteNumber(assetBalance?.used);
+    const total = toFiniteNumber(assetBalance?.total);
+    const hasFiniteValue =
+        Number.isFinite(free) || Number.isFinite(used) || Number.isFinite(total);
+    if (!hasFiniteValue) return rows.slice(0, balanceLimit);
+
+    return [
+        {
+            asset: resolvedAsset,
+            free: toNullableRounded(free, 8),
+            used: toNullableRounded(used, 8),
+            total: toNullableRounded(total, 8),
+        },
+        ...rows,
+    ].slice(0, balanceLimit);
+}
+
+function normalizeExecutionWalletBalances(balance, balanceLimit = 8) {
+    const { totalMap, freeMap, usedMap } = getExecutionBalanceMaps(balance);
 
     const rows = [];
 
@@ -5542,6 +6122,54 @@ app.post('/api/auth/logout', (req, res) => {
             expiresAt: null,
         },
     });
+});
+
+app.get('/api/execution/events/stream', requireExecutionEventStreamAuth, (req, res) => {
+    const limit = parseLimit(req.query.limit, 10, runtimeEventLimit);
+    const filters = parseExecutionEventFilters(req.query);
+    const clientId = ++executionEventStreamClientSeq;
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
+
+    res.write('retry: 2000\n\n');
+
+    const recentEvents = runtimeEvents
+        .filter((entry) => isExecutionEventFeedItem(entry.event))
+        .filter((entry) => matchesExecutionEventFilters(entry, filters))
+        .slice(-limit);
+
+    for (const entry of recentEvents) {
+        try {
+            res.write(`id: ${entry.timestamp ?? Date.now()}\n`);
+            res.write(`data: ${JSON.stringify(entry)}\n\n`);
+        } catch {
+            // If initial replay fails, just terminate this stream.
+            try {
+                res.end();
+            } catch {
+                // Ignore close errors.
+            }
+            return;
+        }
+    }
+
+    executionEventStreamClients.set(clientId, {
+        res,
+        filters,
+    });
+    ensureExecutionEventStreamHeartbeat();
+
+    const handleClose = () => {
+        removeExecutionEventStreamClient(clientId);
+    };
+    req.on('close', handleClose);
+    req.on('error', handleClose);
 });
 
 app.use('/api/execution', requireExecutionAdminAuth);
@@ -5800,11 +6428,15 @@ async function sendDiscordPeriodicReportNow() {
         const snapshot = await fetchExecutionEngineMarketSnapshot();
         const running = executionEngineState.running;
         const posState = executionEngineState.positionState;
+        const periodicPremiumValue =
+            executionEngineState.premiumBasis === 'USDT'
+                ? snapshot.kimchiPremiumPercentUsdt
+                : snapshot.kimchiPremiumPercent;
         const marketFields = buildDiscordMarketCoreFields(snapshot, {
-            premiumLabel: '김치프리미엄(USD)',
-            premiumValue: snapshot.kimchiPremiumPercent,
+            premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
+            premiumValue: periodicPremiumValue,
             includePremium: true,
-            includeUsdtPremium: true,
+            includeUsdtPremium: false,
         });
 
         // 정기 보고는 쿨다운 무시
@@ -5853,7 +6485,7 @@ function handlePremiumThresholdAlerts({ marketSnapshot, premiumValue, previousPr
                 premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
                 premiumValue,
                 includePremium: true,
-                includeUsdtPremium: true,
+                includeUsdtPremium: false,
             });
             void sendDiscordNotification({
                 title: `🔺 김프 ${round(tv, 2)}% 이상 (${round(premiumValue, 2)}%)`,
@@ -5873,7 +6505,7 @@ function handlePremiumThresholdAlerts({ marketSnapshot, premiumValue, previousPr
                 premiumLabel: executionEngineState.premiumBasis === 'USDT' ? '김치프리미엄(USDT)' : '김치프리미엄(USD)',
                 premiumValue,
                 includePremium: true,
-                includeUsdtPremium: true,
+                includeUsdtPremium: false,
             });
             void sendDiscordNotification({
                 title: `🔻 김프 ${round(tv, 2)}% 이하 (${round(premiumValue, 2)}%)`,
@@ -6051,7 +6683,7 @@ app.get('/api/execution/binance/status', async (req, res) => {
         ]);
 
         const balanceAsset = marketType === 'usdm' ? 'USDT' : 'BTC';
-        const assetBalance = balance?.[balanceAsset] ?? {};
+        const assetBalance = resolveExecutionAssetBalance(balance, balanceAsset);
 
         const payload = {
             timestamp: Date.now(),
@@ -6068,9 +6700,9 @@ app.get('/api/execution/binance/status', async (req, res) => {
             serverTime: Number.isFinite(serverTime) ? serverTime : null,
             balance: {
                 asset: balanceAsset,
-                free: toNullableRounded(assetBalance?.free, 8),
-                used: toNullableRounded(assetBalance?.used, 8),
-                total: toNullableRounded(assetBalance?.total, 8),
+                free: toNullableRounded(assetBalance.free, 8),
+                used: toNullableRounded(assetBalance.used, 8),
+                total: toNullableRounded(assetBalance.total, 8),
             },
         };
 
@@ -6179,12 +6811,12 @@ app.get('/api/execution/engine/readiness', async (req, res) => {
 
     checks.push({
         key: 'engine_thresholds_valid',
-        ok: executionEngineState.entryThreshold > executionEngineState.exitThreshold,
+        ok: executionEngineState.entryThreshold < executionEngineState.exitThreshold,
         severity: 'error',
         message:
-            executionEngineState.entryThreshold > executionEngineState.exitThreshold
+            executionEngineState.entryThreshold < executionEngineState.exitThreshold
                 ? 'engine thresholds are valid'
-                : 'engine entryThreshold must be greater than exitThreshold',
+                : 'engine entryThreshold must be less than exitThreshold',
     });
 
     const orderBalancePctEntryOk =
@@ -6390,9 +7022,13 @@ app.get('/api/execution/binance/portfolio', async (req, res) => {
             })(),
         ]);
 
-        const walletBalances = normalizeExecutionWalletBalances(balance, balanceLimit);
+        const assetBalance = resolveExecutionAssetBalance(balance, balanceAsset);
+        const walletBalances = ensureExecutionBalanceAssetRow(
+            normalizeExecutionWalletBalances(balance, balanceLimit),
+            assetBalance,
+            balanceLimit
+        );
         const positions = normalizeExecutionPositions(rawPositions);
-        const assetBalance = balance?.[balanceAsset] ?? {};
 
         const totalUnrealizedPnl = positions.reduce((sum, position) => {
             const pnl = toFiniteNumber(position?.unrealizedPnl);
@@ -6414,9 +7050,9 @@ app.get('/api/execution/binance/portfolio', async (req, res) => {
             walletBalances,
             positions,
             summary: {
-                walletAssetFree: toNullableRounded(assetBalance?.free, 8),
-                walletAssetUsed: toNullableRounded(assetBalance?.used, 8),
-                walletAssetTotal: toNullableRounded(assetBalance?.total, 8),
+                walletAssetFree: toNullableRounded(assetBalance.free, 8),
+                walletAssetUsed: toNullableRounded(assetBalance.used, 8),
+                walletAssetTotal: toNullableRounded(assetBalance.total, 8),
                 walletBalanceCount: walletBalances.length,
                 activePositionCount: positions.length,
                 totalUnrealizedPnl: hasUnrealizedPnl
@@ -6461,6 +7097,112 @@ app.get('/api/execution/binance/portfolio', async (req, res) => {
                 totalUnrealizedPnl: null,
             },
             error: `Failed to fetch Binance portfolio: ${message}`,
+        });
+    }
+});
+
+app.get('/api/execution/binance/spot/portfolio', async (req, res) => {
+    const startedAt = Date.now();
+    const symbol = parseOptionalString(req.query.symbol, 32) ?? 'BTC/USDT';
+    const balanceLimit = Math.floor(parseNumber(req.query.balanceLimit, 8, 1, 30));
+    const hasCredentials = hasBinanceExecutionCredentials();
+    const balanceAsset = 'USDT';
+
+    if (!hasCredentials) {
+        res.status(200).json({
+            timestamp: Date.now(),
+            connected: false,
+            configured: false,
+            marketType: 'spot',
+            symbol,
+            testnet: binanceExecutionTestnet,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances: [],
+            positions: [],
+            summary: {
+                walletAssetFree: null,
+                walletAssetUsed: null,
+                walletAssetTotal: null,
+                walletBalanceCount: 0,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+            error: 'BINANCE_API_KEY/BINANCE_API_SECRET is not configured',
+        });
+        recordRuntimeEvent('warn', 'api_execution_binance_spot_portfolio_not_configured', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            testnet: binanceExecutionTestnet,
+        });
+        return;
+    }
+
+    try {
+        const client = await getBinanceSpotExecutionClient(true);
+        const balance = await client.fetchBalance();
+        const assetBalance = resolveExecutionAssetBalance(balance, balanceAsset);
+        const walletBalances = ensureExecutionBalanceAssetRow(
+            normalizeExecutionWalletBalances(balance, balanceLimit),
+            assetBalance,
+            balanceLimit
+        );
+        const positions = [];
+
+        const payload = {
+            timestamp: Date.now(),
+            connected: true,
+            configured: true,
+            marketType: 'spot',
+            symbol,
+            testnet: binanceExecutionTestnet,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances,
+            positions,
+            summary: {
+                walletAssetFree: toNullableRounded(assetBalance.free, 8),
+                walletAssetUsed: toNullableRounded(assetBalance.used, 8),
+                walletAssetTotal: toNullableRounded(assetBalance.total, 8),
+                walletBalanceCount: walletBalances.length,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+        };
+
+        res.json(payload);
+        recordRuntimeEvent('info', 'api_execution_binance_spot_portfolio_success', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            walletBalanceCount: walletBalances.length,
+        });
+    } catch (error) {
+        const message = toErrorMessage(error);
+        recordRuntimeEvent('error', 'api_execution_binance_spot_portfolio_failure', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            error: message,
+        });
+        res.status(500).json({
+            timestamp: Date.now(),
+            connected: false,
+            configured: true,
+            marketType: 'spot',
+            symbol,
+            testnet: binanceExecutionTestnet,
+            balanceAsset,
+            safety: getExecutionSafetySummary(),
+            walletBalances: [],
+            positions: [],
+            summary: {
+                walletAssetFree: null,
+                walletAssetUsed: null,
+                walletAssetTotal: null,
+                walletBalanceCount: 0,
+                activePositionCount: 0,
+                totalUnrealizedPnl: null,
+            },
+            error: `Failed to fetch Binance spot portfolio: ${message}`,
         });
     }
 });
@@ -6688,6 +7430,15 @@ app.post('/api/execution/engine/start', async (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const marketType = normalizeExecutionMarketType(body.marketType);
     const symbol = parseExecutionSymbol(body.symbol, marketType);
+    const rawBinanceEntrySide =
+        typeof body.binanceEntrySide === 'string' ? body.binanceEntrySide.trim().toLowerCase() : null;
+    const binanceEntrySide = parseExecutionEngineEntrySide(body.binanceEntrySide, executionEngineState.binanceEntrySide);
+    const binanceLeverageRaw = toFiniteNumber(body.binanceLeverage);
+    const binanceLeverage = Number.isFinite(binanceLeverageRaw)
+        ? Math.floor(binanceLeverageRaw)
+        : executionEngineState.binanceLeverage;
+    const parsedBinanceMarginMode = parseExecutionMarginMode(body.binanceMarginMode);
+    const binanceMarginMode = parsedBinanceMarginMode ?? executionEngineState.binanceMarginMode;
     const dryRun = parseBoolean(body.dryRun, true);
     const premiumBasis = normalizePremiumBasis(body.premiumBasis);
     const entryThreshold = toFiniteNumber(body.entryThreshold);
@@ -6704,8 +7455,31 @@ app.post('/api/execution/engine/start', async (req, res) => {
         return;
     }
 
-    if (entryThreshold <= exitThreshold) {
-        res.status(400).json({ error: 'entryThreshold must be greater than exitThreshold' });
+    if (entryThreshold >= exitThreshold) {
+        res.status(400).json({ error: 'entryThreshold must be less than exitThreshold' });
+        return;
+    }
+
+    if (rawBinanceEntrySide && rawBinanceEntrySide !== 'short' && rawBinanceEntrySide !== 'long') {
+        res.status(400).json({ error: 'binanceEntrySide must be short|long' });
+        return;
+    }
+
+    if (
+        body.binanceLeverage !== undefined &&
+        body.binanceLeverage !== null &&
+        (!Number.isFinite(binanceLeverage) || binanceLeverage < 1 || binanceLeverage > 125)
+    ) {
+        res.status(400).json({ error: 'binanceLeverage must be between 1 and 125' });
+        return;
+    }
+
+    if (
+        body.binanceMarginMode !== undefined &&
+        body.binanceMarginMode !== null &&
+        !parsedBinanceMarginMode
+    ) {
+        res.status(400).json({ error: 'binanceMarginMode must be isolated|cross' });
         return;
     }
 
@@ -6803,6 +7577,9 @@ app.post('/api/execution/engine/start', async (req, res) => {
         await startExecutionEngine({
             marketType,
             symbol,
+            binanceEntrySide,
+            binanceLeverage,
+            binanceMarginMode,
             dryRun,
             premiumBasis,
             orderBalancePctEntry,
@@ -6853,12 +7630,19 @@ app.post('/api/execution/binance/order', async (req, res) => {
     const side = parseExecutionOrderSide(body.side);
     const type = parseExecutionOrderType(body.type ?? 'market');
     const amount = toFiniteNumber(body.amount);
+    const balancePct = toFiniteNumber(body.balancePct);
+    const hasExplicitAmount = Number.isFinite(amount) && amount > 0;
+    const hasBalancePct = Number.isFinite(balancePct);
+    const useBalancePct = !hasExplicitAmount && hasBalancePct;
     const rawPrice = toFiniteNumber(body.price);
     const dryRun = parseBoolean(body.dryRun, false);
     const allowInSafeMode = parseBoolean(body.allowInSafeMode, false);
     const reduceOnly = parseBoolean(body.reduceOnly, false);
     const timeInForce = parseExecutionTimeInForce(body.timeInForce, type === 'limit' ? 'GTC' : null);
     const positionSide = parseExecutionPositionSide(body.positionSide);
+    const leverageRaw = toFiniteNumber(body.leverage);
+    const leverage = Number.isFinite(leverageRaw) ? Math.floor(leverageRaw) : null;
+    const marginMode = parseExecutionMarginMode(body.marginMode);
     const clientOrderId = parseOptionalString(body.clientOrderId ?? body.newClientOrderId, 64);
     const strategyContextRaw = parseExecutionStrategyContext(body.strategyContext);
     const strategyContext = strategyContextRaw
@@ -6888,16 +7672,31 @@ app.post('/api/execution/binance/order', async (req, res) => {
         return;
     }
 
-    if (!Number.isFinite(amount) || amount <= 0) {
+    if (hasBalancePct && (balancePct <= 0 || balancePct > 100)) {
         recordRuntimeEvent('warn', 'api_execution_binance_order_validation_failed', {
             durationMs: Date.now() - startedAt,
             marketType,
             symbol,
-            reason: 'invalid_amount',
-            amount: body.amount ?? null,
+            reason: 'invalid_balance_pct',
+            balancePct: body.balancePct ?? null,
         });
         res.status(400).json({
-            error: 'amount must be a positive number',
+            error: 'balancePct must be between 0 and 100',
+        });
+        return;
+    }
+
+    if (!hasExplicitAmount && !useBalancePct) {
+        recordRuntimeEvent('warn', 'api_execution_binance_order_validation_failed', {
+            durationMs: Date.now() - startedAt,
+            marketType,
+            symbol,
+            reason: 'invalid_amount_or_balance_pct',
+            amount: body.amount ?? null,
+            balancePct: body.balancePct ?? null,
+        });
+        res.status(400).json({
+            error: 'amount(>0) or balancePct(0~100) is required',
         });
         return;
     }
@@ -6912,6 +7711,34 @@ app.post('/api/execution/binance/order', async (req, res) => {
         });
         res.status(400).json({
             error: 'price must be a positive number for limit order',
+        });
+        return;
+    }
+
+    if (body.marginMode !== undefined && body.marginMode !== null && !marginMode) {
+        recordRuntimeEvent('warn', 'api_execution_binance_order_validation_failed', {
+            durationMs: Date.now() - startedAt,
+            marketType,
+            symbol,
+            reason: 'invalid_margin_mode',
+            marginMode: body.marginMode ?? null,
+        });
+        res.status(400).json({
+            error: 'marginMode must be isolated|cross',
+        });
+        return;
+    }
+
+    if (body.leverage !== undefined && body.leverage !== null && (!Number.isFinite(leverage) || leverage < 1 || leverage > 125)) {
+        recordRuntimeEvent('warn', 'api_execution_binance_order_validation_failed', {
+            durationMs: Date.now() - startedAt,
+            marketType,
+            symbol,
+            reason: 'invalid_leverage',
+            leverage: body.leverage ?? null,
+        });
+        res.status(400).json({
+            error: 'leverage must be an integer between 1 and 125',
         });
         return;
     }
@@ -6988,10 +7815,13 @@ app.post('/api/execution/binance/order', async (req, res) => {
         side,
         type,
         amount,
+        balancePct,
         price,
         reduceOnly,
         timeInForce,
         positionSide,
+        leverage,
+        marginMode,
         clientOrderId,
         dryRun,
     });
@@ -7033,6 +7863,109 @@ app.post('/api/execution/binance/order', async (req, res) => {
     beginExecutionIdempotentRequest(idempotencyKey, orderFingerprint);
 
     try {
+        let client = null;
+        const resolvedLeverage = Number.isFinite(leverage) ? leverage : 1;
+        const resolvedBalancePct = useBalancePct ? Math.min(100, balancePct) : null;
+        const pctFactor =
+            Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                ? resolvedBalancePct / 100
+                : null;
+        let resolvedOrderAmount = hasExplicitAmount ? amount : NaN;
+
+        const resolveReferencePrice = async () => {
+            if (Number.isFinite(rawPrice) && rawPrice > 0) return rawPrice;
+            if (!client) return NaN;
+            const ticker = await client.fetchTicker(symbol);
+            const candidates = [
+                toFiniteNumber(ticker?.last),
+                toFiniteNumber(ticker?.close),
+                toFiniteNumber(ticker?.mark),
+                toFiniteNumber(ticker?.bid),
+                toFiniteNumber(ticker?.ask),
+            ];
+            for (const candidate of candidates) {
+                if (Number.isFinite(candidate) && candidate > 0) {
+                    return Number(candidate);
+                }
+            }
+            return NaN;
+        };
+
+        if (useBalancePct) {
+            if (!Number.isFinite(pctFactor) || pctFactor <= 0) {
+                throw new Error('balancePct must be a positive number');
+            }
+
+            const canFetchForSizing = !dryRun || hasBinanceExecutionCredentials();
+            if (canFetchForSizing) {
+                client = await getBinanceExecutionClient(marketType, !dryRun);
+
+                if (reduceOnly) {
+                    const closingTargetSide = side === 'buy' ? 'short' : 'long';
+                    const positions = await client.fetchPositions([symbol]);
+                    const snapshot = resolveDirectionalPositionSnapshot(
+                        positions,
+                        symbol,
+                        closingTargetSide
+                    );
+                    if (snapshot.targetContracts <= 0) {
+                        throw new Error(`No ${closingTargetSide} position to close for ${symbol}`);
+                    }
+                    resolvedOrderAmount = round(snapshot.targetContracts * pctFactor, 8);
+                } else {
+                    const balance = await client.fetchBalance();
+                    const balanceAsset = marketType === 'usdm' ? 'USDT' : 'BTC';
+                    const balanceSnapshot = resolveExecutionAssetBalance(balance, balanceAsset);
+                    const freeBalance = toFiniteNumber(balanceSnapshot.free);
+                    if (!Number.isFinite(freeBalance) || freeBalance <= 0) {
+                        throw new Error(`Insufficient ${balanceAsset} balance (${freeBalance})`);
+                    }
+
+                    const referencePrice = await resolveReferencePrice();
+                    if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+                        throw new Error('Failed to resolve reference price for balancePct sizing');
+                    }
+
+                    if (marketType === 'usdm') {
+                        const notionalUsd = freeBalance * pctFactor * resolvedLeverage;
+                        resolvedOrderAmount = round(notionalUsd / referencePrice, 8);
+                    } else {
+                        const market =
+                            client && typeof client.market === 'function'
+                                ? client.market(symbol)
+                                : null;
+                        const contractSize = toFiniteNumber(market?.contractSize);
+                        if (market?.inverse && Number.isFinite(contractSize) && contractSize > 0) {
+                            const notionalUsd = freeBalance * pctFactor * referencePrice * resolvedLeverage;
+                            resolvedOrderAmount = round(notionalUsd / contractSize, 8);
+                        } else {
+                            const notionalUsd = freeBalance * pctFactor * resolvedLeverage;
+                            resolvedOrderAmount = round(notionalUsd / referencePrice, 8);
+                        }
+                    }
+                }
+            } else {
+                const fallbackPrice =
+                    Number.isFinite(rawPrice) && rawPrice > 0
+                        ? rawPrice
+                        : Number.isFinite(toFiniteNumber(strategyContext?.usdPrice))
+                            ? Number(strategyContext.usdPrice)
+                            : 100000;
+                if (reduceOnly) {
+                    resolvedOrderAmount = 0.001;
+                } else if (marketType === 'usdm') {
+                    resolvedOrderAmount = round((1000 * pctFactor * resolvedLeverage) / fallbackPrice, 8);
+                } else {
+                    resolvedOrderAmount = round(0.001 * pctFactor * resolvedLeverage, 8);
+                }
+            }
+        }
+
+        if (!Number.isFinite(resolvedOrderAmount) || resolvedOrderAmount <= 0) {
+            throw new Error(`amount must be a positive number (resolved=${resolvedOrderAmount})`);
+        }
+        const roundedOrderAmount = round(resolvedOrderAmount, 8);
+
         const baseResponse = {
             timestamp: Date.now(),
             marketType,
@@ -7042,11 +7975,17 @@ app.post('/api/execution/binance/order', async (req, res) => {
             request: {
                 side,
                 type,
-                amount: round(amount, 8),
+                amount: roundedOrderAmount,
+                balancePct:
+                    Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                        ? round(resolvedBalancePct, 4)
+                        : null,
                 price: Number.isFinite(price) ? round(price, 8) : null,
                 reduceOnly,
                 timeInForce,
                 positionSide,
+                leverage: Number.isFinite(leverage) ? leverage : null,
+                marginMode: marginMode ?? null,
                 clientOrderId,
             },
             retry: {
@@ -7071,10 +8010,10 @@ app.post('/api/execution/binance/order', async (req, res) => {
                     symbol,
                     type,
                     side,
-                    amount: round(amount, 8),
+                    amount: roundedOrderAmount,
                     price: Number.isFinite(price) ? round(price, 8) : null,
                     filled: 0,
-                    remaining: round(amount, 8),
+                    remaining: roundedOrderAmount,
                     cost: 0,
                     average: null,
                     timestamp: Date.now(),
@@ -7089,7 +8028,13 @@ app.post('/api/execution/binance/order', async (req, res) => {
                 symbol,
                 side,
                 type,
-                amount: round(amount, 8),
+                amount: roundedOrderAmount,
+                balancePct:
+                    Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                        ? round(resolvedBalancePct, 4)
+                        : null,
+                leverage,
+                marginMode,
                 strategyContext,
             });
             completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
@@ -7097,12 +8042,39 @@ app.post('/api/execution/binance/order', async (req, res) => {
             return;
         }
 
-        const client = await getBinanceExecutionClient(marketType, true);
+        if (!client) {
+            client = await getBinanceExecutionClient(marketType, true);
+        }
         const params = {};
         if (reduceOnly) params.reduceOnly = true;
         if (timeInForce) params.timeInForce = timeInForce;
         if (positionSide) params.positionSide = positionSide;
         if (clientOrderId) params.newClientOrderId = clientOrderId;
+
+        if (marginMode) {
+            try {
+                await client.setMarginMode(marginMode, symbol);
+            } catch (error) {
+                const marginMessage = toErrorMessage(error);
+                const normalizedMarginMessage = marginMessage.toLowerCase();
+                const isNoopMarginChange =
+                    normalizedMarginMessage.includes('no need to change margin type') ||
+                    normalizedMarginMessage.includes('code":-4046') ||
+                    normalizedMarginMessage.includes('margin type is already');
+                if (!isNoopMarginChange) {
+                    throw new Error(`Failed to set margin mode(${marginMode}): ${marginMessage}`);
+                }
+            }
+        }
+
+        if (Number.isFinite(leverage)) {
+            try {
+                await client.setLeverage(leverage, symbol);
+            } catch (error) {
+                const leverageMessage = toErrorMessage(error);
+                throw new Error(`Failed to set leverage(${leverage}x): ${leverageMessage}`);
+            }
+        }
 
         let order = null;
         let attempt = 1;
@@ -7112,7 +8084,7 @@ app.post('/api/execution/binance/order', async (req, res) => {
                     symbol,
                     type,
                     side,
-                    amount,
+                    resolvedOrderAmount,
                     Number.isFinite(price) ? price : undefined,
                     params
                 );
@@ -7127,7 +8099,7 @@ app.post('/api/execution/binance/order', async (req, res) => {
                     symbol,
                     side,
                     type,
-                    amount: round(amount, 8),
+                    amount: roundedOrderAmount,
                     attempt,
                     maxAttempts: retries + 1,
                     error: message,
@@ -7178,7 +8150,13 @@ app.post('/api/execution/binance/order', async (req, res) => {
             symbol,
             side,
             type,
-            amount: round(amount, 8),
+            amount: roundedOrderAmount,
+            balancePct:
+                Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                    ? round(resolvedBalancePct, 4)
+                    : null,
+            leverage,
+            marginMode,
             attempt,
             orderId: payload.order.id,
             clientOrderId: payload.order.clientOrderId,
@@ -7195,7 +8173,13 @@ app.post('/api/execution/binance/order', async (req, res) => {
             symbol,
             side,
             type,
-            amount: Number.isFinite(amount) ? round(amount, 8) : null,
+            amount: hasExplicitAmount ? round(amount, 8) : null,
+            balancePct:
+                Number.isFinite(balancePct) && balancePct > 0
+                    ? round(balancePct, 4)
+                    : null,
+            leverage,
+            marginMode,
             error: message,
         });
         failExecutionIdempotentRequest(idempotencyKey);
@@ -7402,6 +8386,10 @@ app.post('/api/execution/bithumb/order', async (req, res) => {
     const side = parseExecutionOrderSide(body.side);
     const type = parseExecutionOrderType(body.type ?? 'market');
     const amount = toFiniteNumber(body.amount);
+    const balancePct = toFiniteNumber(body.balancePct);
+    const hasExplicitAmount = Number.isFinite(amount) && amount > 0;
+    const hasBalancePct = Number.isFinite(balancePct);
+    const useBalancePct = !hasExplicitAmount && hasBalancePct;
     const rawPrice = toFiniteNumber(body.price);
     const dryRun = parseBoolean(body.dryRun, false);
     const allowInSafeMode = parseBoolean(body.allowInSafeMode, false);
@@ -7423,8 +8411,13 @@ app.post('/api/execution/bithumb/order', async (req, res) => {
         return;
     }
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-        res.status(400).json({ error: 'amount must be a positive number' });
+    if (hasBalancePct && (balancePct <= 0 || balancePct > 100)) {
+        res.status(400).json({ error: 'balancePct must be between 0 and 100' });
+        return;
+    }
+
+    if (!hasExplicitAmount && !useBalancePct) {
+        res.status(400).json({ error: 'amount(>0) or balancePct(0~100) is required' });
         return;
     }
 
@@ -7449,16 +8442,48 @@ app.post('/api/execution/bithumb/order', async (req, res) => {
         return;
     }
 
-    const orderFingerprint = generateExecutionOrderFingerprint({
-        exchange: 'bithumb',
+    const orderFingerprint = buildExecutionOrderFingerprint({
+        marketType: 'spot',
         symbol,
         side,
         type,
         amount,
+        balancePct,
         price: rawPrice,
+        reduceOnly: false,
+        timeInForce: null,
+        positionSide: null,
+        leverage: null,
+        marginMode: null,
+        clientOrderId: null,
+        dryRun,
     });
 
-    if (!dryRun && checkExecutionIdempotency(idempotencyKey, orderFingerprint, res)) {
+    const idempotencyState = getExecutionIdempotencyReplay(idempotencyKey, orderFingerprint);
+    if (idempotencyState.kind === 'conflict') {
+        res.status(409).json({
+            error: 'Idempotency key already exists for a different order request',
+        });
+        return;
+    }
+
+    if (idempotencyState.kind === 'pending') {
+        res.status(409).json({
+            error: 'Order with this idempotency key is already in progress',
+        });
+        return;
+    }
+
+    if (idempotencyState.kind === 'replay') {
+        const record = idempotencyState.record ?? {};
+        res.setHeader('x-idempotency-replay', 'true');
+        res.status(Number(record.statusCode) || 200).json({
+            ...(record.responseBody ?? {}),
+            idempotency: {
+                key: idempotencyKey,
+                replayed: true,
+            },
+        });
         recordRuntimeEvent('info', 'api_execution_bithumb_order_idempotent_hit', {
             durationMs: Date.now() - startedAt,
             symbol,
@@ -7469,203 +8494,307 @@ app.post('/api/execution/bithumb/order', async (req, res) => {
         return;
     }
 
-    let price = rawPrice;
-    if (type === 'market') {
-        price = undefined; // ccxt market order takes undefined for price
-    }
+    beginExecutionIdempotentRequest(idempotencyKey, orderFingerprint);
 
-    const baseResponse = {
-        timestamp: Date.now(),
-        marketType: 'spot',
-        testnet: false,
-        exchange: 'bithumb',
-        request: {
-            symbol,
-            side,
-            type,
-            amount: round(amount, 8),
-            price: Number.isFinite(price) ? round(price, 8) : null,
-            dryRun,
-        },
-        retry: {
-            attempt: 1,
-            maxAttempts: retries + 1,
-        },
-        strategyContext,
-    };
+    try {
+        let client = null;
+        const resolvedBalancePct = useBalancePct ? Math.min(100, balancePct) : null;
+        const pctFactor =
+            Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                ? resolvedBalancePct / 100
+                : null;
+        let resolvedOrderAmount = hasExplicitAmount ? amount : NaN;
 
-    if (dryRun) {
-        const payload = {
-            ...baseResponse,
-            order: {
-                id: `dry-run-${Date.now()}`,
-                status: 'simulated',
+        if (useBalancePct) {
+            if (!Number.isFinite(pctFactor) || pctFactor <= 0) {
+                throw new Error('balancePct must be a positive number');
+            }
+
+            const canFetchForSizing = !dryRun || hasBithumbExecutionCredentials();
+            if (canFetchForSizing) {
+                client = await getBithumbExecutionClient(!dryRun);
+                const balance = await client.fetchBalance();
+
+                if (side === 'buy') {
+                    const freeKrw = toFiniteNumber(balance?.KRW?.free ?? balance?.krw?.free);
+                    if (!Number.isFinite(freeKrw) || freeKrw <= 0) {
+                        throw new Error('Insufficient KRW balance on Bithumb');
+                    }
+
+                    let referencePrice =
+                        Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : NaN;
+                    if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+                        const ticker = await client.fetchTicker(symbol);
+                        const candidates = [
+                            toFiniteNumber(ticker?.last),
+                            toFiniteNumber(ticker?.close),
+                            toFiniteNumber(ticker?.bid),
+                            toFiniteNumber(ticker?.ask),
+                        ];
+                        for (const candidate of candidates) {
+                            if (Number.isFinite(candidate) && candidate > 0) {
+                                referencePrice = Number(candidate);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+                        throw new Error('Failed to resolve KRW reference price for balancePct sizing');
+                    }
+
+                    resolvedOrderAmount = round((freeKrw * pctFactor) / referencePrice, 8);
+                } else {
+                    const freeBtc = toFiniteNumber(balance?.BTC?.free ?? balance?.btc?.free);
+                    if (!Number.isFinite(freeBtc) || freeBtc <= 0) {
+                        throw new Error('Insufficient BTC balance on Bithumb');
+                    }
+                    resolvedOrderAmount = round(freeBtc * pctFactor, 8);
+                }
+            } else if (side === 'buy') {
+                const fallbackPrice =
+                    Number.isFinite(rawPrice) && rawPrice > 0
+                        ? rawPrice
+                        : Number.isFinite(toFiniteNumber(strategyContext?.krwPrice))
+                            ? Number(strategyContext.krwPrice)
+                            : 150000000;
+                resolvedOrderAmount = round((1_000_000 * pctFactor) / fallbackPrice, 8);
+            } else {
+                resolvedOrderAmount = round(1 * pctFactor, 8);
+            }
+        }
+
+        if (!Number.isFinite(resolvedOrderAmount) || resolvedOrderAmount <= 0) {
+            throw new Error(`amount must be a positive number (resolved=${resolvedOrderAmount})`);
+        }
+
+        let price = rawPrice;
+        if (type === 'market') {
+            price = undefined; // ccxt market order takes undefined for price
+        }
+        const roundedOrderAmount = round(resolvedOrderAmount, 8);
+
+        const baseResponse = {
+            timestamp: Date.now(),
+            marketType: 'spot',
+            testnet: false,
+            exchange: 'bithumb',
+            request: {
                 symbol,
-                type,
                 side,
-                amount: round(amount, 8),
+                type,
+                amount: roundedOrderAmount,
+                balancePct:
+                    Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                        ? round(resolvedBalancePct, 4)
+                        : null,
                 price: Number.isFinite(price) ? round(price, 8) : null,
-                filled: 0,
-                remaining: round(amount, 8),
-                cost: 0,
-                average: null,
-                timestamp: Date.now(),
-                datetime: new Date().toISOString(),
+                dryRun,
             },
-            safety: getExecutionSafetySummary(),
+            retry: {
+                attempt: 1,
+                maxAttempts: retries + 1,
+            },
+            idempotency: {
+                key: idempotencyKey,
+                replayed: false,
+            },
+            strategyContext,
         };
 
-        recordRuntimeEvent('info', 'api_execution_bithumb_order_dry_run', {
-            durationMs: Date.now() - startedAt,
-            symbol,
-            side,
-            type,
-            amount: round(amount, 8),
-            strategyContext,
-        });
-        completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
-        res.json(payload);
-        return;
-    }
+        if (dryRun) {
+            const payload = {
+                ...baseResponse,
+                order: {
+                    id: `dry-run-${Date.now()}`,
+                    status: 'simulated',
+                    symbol,
+                    type,
+                    side,
+                    amount: roundedOrderAmount,
+                    price: Number.isFinite(price) ? round(price, 8) : null,
+                    filled: 0,
+                    remaining: roundedOrderAmount,
+                    cost: 0,
+                    average: null,
+                    timestamp: Date.now(),
+                    datetime: new Date().toISOString(),
+                },
+                safety: getExecutionSafetySummary(),
+            };
 
-    const client = await getBithumbExecutionClient(true);
-
-    let order = null;
-    let attempt = 1;
-    for (attempt = 1; attempt <= retries + 1; attempt += 1) {
-        try {
-            order = await client.createOrder(
-                symbol,
-                type,
-                side,
-                amount,
-                Number.isFinite(price) ? price : undefined
-            );
-            break;
-        } catch (error) {
-            const isLastAttempt = attempt >= retries + 1;
-            const message = toErrorMessage(error);
-
-            recordRuntimeEvent('warn', 'api_execution_bithumb_order_attempt_failed', {
+            recordRuntimeEvent('info', 'api_execution_bithumb_order_dry_run', {
                 durationMs: Date.now() - startedAt,
                 symbol,
                 side,
                 type,
-                amount: round(amount, 8),
-                attempt,
-                maxAttempts: retries + 1,
-                error: message,
+                amount: roundedOrderAmount,
+                balancePct:
+                    Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                        ? round(resolvedBalancePct, 4)
+                        : null,
+                strategyContext,
             });
-
-            if (isLastAttempt) {
-                throw error;
-            }
-
-            await wait(retryDelayMs * attempt);
+            completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
+            res.json(payload);
+            return;
         }
-    }
 
-    const payload = {
-        ...baseResponse,
-        retry: {
-            ...baseResponse.retry,
-            attempt,
-        },
-        order: {
-            id: order?.id ?? null,
-            clientOrderId: null, // Bithumb typically doesn't support clientOrderId
-            status: order?.status ?? null,
-            symbol: order?.symbol ?? symbol,
-            type: order?.type ?? type,
-            side: order?.side ?? side,
-            amount: order?.amount == null ? null : round(order.amount, 8),
-            price: order?.price == null ? null : round(order.price, 8),
-            filled: order?.filled == null ? null : round(order.filled, 8),
-            remaining: order?.remaining == null ? null : round(order.remaining, 8),
-            cost: order?.cost == null ? null : round(order.cost, 8),
-            average: order?.average == null ? null : round(order.average, 8),
-            timestamp: order?.timestamp == null ? null : Number(order.timestamp),
-            datetime: typeof order?.datetime === 'string' ? order.datetime : null,
-            fee: order?.fee
-                ? {
-                    currency: order.fee.currency ?? null,
-                    cost: order.fee.cost == null ? null : round(order.fee.cost, 8),
-                    rate: order.fee.rate == null ? null : round(order.fee.rate, 8),
+        if (!client) {
+            client = await getBithumbExecutionClient(true);
+        }
+
+        let order = null;
+        let attempt = 1;
+        for (attempt = 1; attempt <= retries + 1; attempt += 1) {
+            try {
+                order = await client.createOrder(
+                    symbol,
+                    type,
+                    side,
+                    resolvedOrderAmount,
+                    Number.isFinite(price) ? price : undefined
+                );
+                break;
+            } catch (error) {
+                const isLastAttempt = attempt >= retries + 1;
+                const message = toErrorMessage(error);
+
+                recordRuntimeEvent('warn', 'api_execution_bithumb_order_attempt_failed', {
+                    durationMs: Date.now() - startedAt,
+                    symbol,
+                    side,
+                    type,
+                    amount: roundedOrderAmount,
+                    attempt,
+                    maxAttempts: retries + 1,
+                    error: message,
+                });
+
+                if (isLastAttempt) {
+                    throw error;
                 }
-                : null,
-        },
-        safety: getExecutionSafetySummary(),
-    };
 
-    recordRuntimeEvent('info', 'api_execution_bithumb_order_success', {
-        durationMs: Date.now() - startedAt,
-        symbol,
-        side,
-        type,
-        amount: round(amount, 8),
-        orderId: payload.order.id,
-        status: payload.order.status,
-        attempt,
-        strategyContext,
-    });
-
-    if (payload.order.status === 'closed') {
-        const discordFields = [
-            { name: '거래소', value: '빗썸', inline: true },
-            { name: '심볼', value: payload.order.symbol, inline: true },
-            { name: '방향', value: payload.order.side === 'buy' ? '🟢 매수' : '🔴 매도', inline: true },
-            { name: '수량', value: `${payload.order.amount ?? amount}`, inline: true },
-            { name: '체결가', value: `${payload.order.average ?? payload.order.price ?? price ?? '시장가'}`, inline: true },
-            { name: '상태', value: '✅ 체결 완료', inline: true },
-        ];
-        if (strategyContext) {
-            const isEntryAction =
-                strategyContext.action === 'ENTRY_SELL' ||
-                strategyContext.action === 'ENTRY_BUY';
-            discordFields.push({
-                name: '전략',
-                value: `${isEntryAction ? '🔴 진입' : '🟢 청산'} (김프: ${strategyContext.effectivePremiumPct ?? strategyContext.premiumPct}%)`,
-                inline: false
-            });
+                await wait(retryDelayMs * attempt);
+            }
         }
-        const marketFields = await getDiscordMarketCoreFields();
-        sendDiscordNotification({
-            title: payload.order.side === 'buy' ? '🟢 빗썸 매수 체결' : '🔴 빗썸 매도 체결',
-            description: '빗썸 거래소에서 현물 시장가 주문이 체결되었습니다.',
-            color: payload.order.side === 'buy' ? 0x10b981 : 0xf43f5e,
-            fields: [...discordFields, ...marketFields]
-        }).catch(() => {});
-    }
 
-    completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
-    res.json(payload);
+        const payload = {
+            ...baseResponse,
+            retry: {
+                ...baseResponse.retry,
+                attempt,
+            },
+            order: {
+                id: order?.id ?? null,
+                clientOrderId: null, // Bithumb typically doesn't support clientOrderId
+                status: order?.status ?? null,
+                symbol: order?.symbol ?? symbol,
+                type: order?.type ?? type,
+                side: order?.side ?? side,
+                amount: order?.amount == null ? null : round(order.amount, 8),
+                price: order?.price == null ? null : round(order.price, 8),
+                filled: order?.filled == null ? null : round(order.filled, 8),
+                remaining: order?.remaining == null ? null : round(order.remaining, 8),
+                cost: order?.cost == null ? null : round(order.cost, 8),
+                average: order?.average == null ? null : round(order.average, 8),
+                timestamp: order?.timestamp == null ? null : Number(order.timestamp),
+                datetime: typeof order?.datetime === 'string' ? order.datetime : null,
+                fee: order?.fee
+                    ? {
+                        currency: order.fee.currency ?? null,
+                        cost: order.fee.cost == null ? null : round(order.fee.cost, 8),
+                        rate: order.fee.rate == null ? null : round(order.fee.rate, 8),
+                    }
+                    : null,
+            },
+            safety: getExecutionSafetySummary(),
+        };
+
+        recordRuntimeEvent('info', 'api_execution_bithumb_order_success', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            side,
+            type,
+            amount: roundedOrderAmount,
+            balancePct:
+                Number.isFinite(resolvedBalancePct) && resolvedBalancePct > 0
+                    ? round(resolvedBalancePct, 4)
+                    : null,
+            orderId: payload.order.id,
+            status: payload.order.status,
+            attempt,
+            strategyContext,
+        });
+
+        if (payload.order.status === 'closed') {
+            const discordFields = [
+                { name: '거래소', value: '빗썸', inline: true },
+                { name: '심볼', value: payload.order.symbol, inline: true },
+                { name: '방향', value: payload.order.side === 'buy' ? '🟢 매수' : '🔴 매도', inline: true },
+                { name: '수량', value: `${payload.order.amount ?? roundedOrderAmount}`, inline: true },
+                { name: '체결가', value: `${payload.order.average ?? payload.order.price ?? price ?? '시장가'}`, inline: true },
+                { name: '상태', value: '✅ 체결 완료', inline: true },
+            ];
+            if (strategyContext) {
+                const isEntryAction =
+                    strategyContext.action === 'ENTRY_SELL' ||
+                    strategyContext.action === 'ENTRY_BUY';
+                discordFields.push({
+                    name: '전략',
+                    value: `${isEntryAction ? '🔴 진입' : '🟢 청산'} (김프: ${strategyContext.effectivePremiumPct ?? strategyContext.premiumPct}%)`,
+                    inline: false
+                });
+            }
+            const marketFields = await getDiscordMarketCoreFields();
+            sendDiscordNotification({
+                title: payload.order.side === 'buy' ? '🟢 빗썸 매수 체결' : '🔴 빗썸 매도 체결',
+                description: '빗썸 거래소에서 현물 시장가 주문이 체결되었습니다.',
+                color: payload.order.side === 'buy' ? 0x10b981 : 0xf43f5e,
+                fields: [...discordFields, ...marketFields]
+            }).catch(() => { });
+        }
+
+        completeExecutionIdempotentRequest(idempotencyKey, 200, payload, orderFingerprint);
+        res.json(payload);
+    } catch (error) {
+        const message = toErrorMessage(error);
+        recordRuntimeEvent('error', 'api_execution_bithumb_order_failure', {
+            durationMs: Date.now() - startedAt,
+            symbol,
+            side,
+            type,
+            amount: hasExplicitAmount ? round(amount, 8) : null,
+            balancePct:
+                Number.isFinite(balancePct) && balancePct > 0
+                    ? round(balancePct, 4)
+                    : null,
+            error: message,
+        });
+        failExecutionIdempotentRequest(idempotencyKey);
+        res.status(500).json({
+            timestamp: Date.now(),
+            marketType: 'spot',
+            symbol,
+            exchange: 'bithumb',
+            testnet: false,
+            idempotency: {
+                key: idempotencyKey,
+                replayed: false,
+            },
+            safety: getExecutionSafetySummary(),
+            error: `Failed to place Bithumb order: ${message}`,
+        });
+    }
 });
 
 app.get('/api/execution/events', (req, res) => {
     const limit = parseLimit(req.query.limit, 50, runtimeEventLimit);
-    const onlyFailures = parseBoolean(req.query.onlyFailures, false);
-    const levelFilter = typeof req.query.level === 'string' ? req.query.level.trim().toLowerCase() : '';
-    const rawMarketType =
-        typeof req.query.marketType === 'string' ? req.query.marketType.trim().toLowerCase() : '';
-    const marketTypeFilter = rawMarketType === 'coinm' || rawMarketType === 'usdm' ? rawMarketType : null;
+    const filters = parseExecutionEventFilters(req.query);
 
-    let filtered = runtimeEvents.filter((entry) => isExecutionEventFeedItem(entry.event));
-
-    if (levelFilter) {
-        filtered = filtered.filter(
-            (entry) => typeof entry.level === 'string' && entry.level.toLowerCase() === levelFilter
-        );
-    }
-
-    if (onlyFailures) {
-        filtered = filtered.filter(
-            (entry) => entry.level === 'error' || (typeof entry.event === 'string' && entry.event.endsWith('_failure'))
-        );
-    }
-
-    if (marketTypeFilter) {
-        filtered = filtered.filter((entry) => entry.marketType === marketTypeFilter);
-    }
+    let filtered = runtimeEvents
+        .filter((entry) => isExecutionEventFeedItem(entry.event))
+        .filter((entry) => matchesExecutionEventFilters(entry, filters));
 
     const events = filtered.slice(-limit).reverse();
 
@@ -7676,9 +8805,9 @@ app.get('/api/execution/events', (req, res) => {
         totalBuffered: runtimeEvents.length,
         filters: {
             limit,
-            onlyFailures,
-            level: levelFilter || null,
-            marketType: marketTypeFilter,
+            onlyFailures: filters.onlyFailures,
+            level: filters.levelFilter,
+            marketType: filters.marketTypeFilter,
         },
         logFile: 'logs/data-load-events.ndjson',
         events,
@@ -7776,6 +8905,9 @@ app.listen(port, () => {
             symbol:
                 executionEngineAutoSymbol ||
                 defaultExecutionSymbolByMarketType(executionEngineAutoMarketType),
+            binanceEntrySide: executionEngineState.binanceEntrySide,
+            binanceLeverage: executionEngineState.binanceLeverage,
+            binanceMarginMode: executionEngineState.binanceMarginMode,
             orderBalancePctEntry: executionEngineAutoEntryPct,
             orderBalancePctExit: executionEngineAutoExitPct,
             dryRun: executionEngineAutoDryRun,
@@ -7787,6 +8919,9 @@ app.listen(port, () => {
         : {
             marketType: executionEngineState.marketType,
             symbol: executionEngineState.symbol,
+            binanceEntrySide: executionEngineState.binanceEntrySide,
+            binanceLeverage: executionEngineState.binanceLeverage,
+            binanceMarginMode: executionEngineState.binanceMarginMode,
             orderBalancePctEntry: executionEngineState.orderBalancePctEntry,
             orderBalancePctExit: executionEngineState.orderBalancePctExit,
             dryRun: executionEngineState.dryRun,
@@ -7813,7 +8948,7 @@ app.listen(port, () => {
         return;
     }
 
-    if (autoStartConfig.entryThreshold <= autoStartConfig.exitThreshold) {
+    if (autoStartConfig.entryThreshold >= autoStartConfig.exitThreshold) {
         recordRuntimeEvent('error', 'execution_engine_autostart_invalid_threshold', {
             source: autoStartConfig.source,
             entryThreshold: autoStartConfig.entryThreshold,
@@ -7830,6 +8965,9 @@ app.listen(port, () => {
                 source: autoStartConfig.source,
                 marketType: autoStartConfig.marketType,
                 symbol: autoStartConfig.symbol,
+                binanceEntrySide: autoStartConfig.binanceEntrySide,
+                binanceLeverage: autoStartConfig.binanceLeverage,
+                binanceMarginMode: autoStartConfig.binanceMarginMode,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
                 orderBalancePctEntry: round(autoStartConfig.orderBalancePctEntry, 4),
@@ -7842,6 +8980,9 @@ app.listen(port, () => {
                 source: autoStartConfig.source,
                 marketType: autoStartConfig.marketType,
                 symbol: autoStartConfig.symbol,
+                binanceEntrySide: autoStartConfig.binanceEntrySide,
+                binanceLeverage: autoStartConfig.binanceLeverage,
+                binanceMarginMode: autoStartConfig.binanceMarginMode,
                 dryRun: autoStartConfig.dryRun,
                 premiumBasis: autoStartConfig.premiumBasis,
                 orderBalancePctEntry: round(autoStartConfig.orderBalancePctEntry, 4),

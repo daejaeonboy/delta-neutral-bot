@@ -341,6 +341,45 @@ export interface BinanceExecutionPortfolioResponse {
   error?: string;
 }
 
+export interface BinanceSpotExecutionPortfolioResponse {
+  timestamp: number;
+  connected: boolean;
+  configured: boolean;
+  marketType: 'spot';
+  symbol: string;
+  testnet: boolean;
+  balanceAsset: string;
+  safety?: ExecutionSafetySummary;
+  walletBalances: Array<{
+    asset: string;
+    free: number | null;
+    used: number | null;
+    total: number | null;
+  }>;
+  positions: Array<{
+    symbol: string;
+    side: string | null;
+    contracts: number | null;
+    contractSize: number | null;
+    notional: number | null;
+    leverage: number | null;
+    entryPrice: number | null;
+    markPrice: number | null;
+    unrealizedPnl: number | null;
+    liquidationPrice: number | null;
+    marginMode: string | null;
+  }>;
+  summary: {
+    walletAssetFree: number | null;
+    walletAssetUsed: number | null;
+    walletAssetTotal: number | null;
+    walletBalanceCount: number;
+    activePositionCount: number;
+    totalUnrealizedPnl: number | null;
+  };
+  error?: string;
+}
+
 export interface BithumbExecutionPortfolioResponse {
   timestamp: number;
   connected: boolean;
@@ -497,6 +536,9 @@ export interface ExecutionEngineState {
   busy: boolean;
   marketType: ExecutionMarketType;
   symbol: string;
+  binanceEntrySide: 'short' | 'long';
+  binanceLeverage: number;
+  binanceMarginMode: 'isolated' | 'cross';
   orderBalancePctEntry: number;
   orderBalancePctExit: number;
   dryRun: boolean;
@@ -554,12 +596,72 @@ export interface ExecutionEngineReadinessResponse {
 export interface StartExecutionEngineRequest {
   marketType: ExecutionMarketType;
   symbol?: string;
+  binanceEntrySide?: 'short' | 'long';
+  binanceLeverage?: number;
+  binanceMarginMode?: 'isolated' | 'cross';
   dryRun: boolean;
   premiumBasis?: 'USD' | 'USDT';
   entryThreshold: number;
   exitThreshold: number;
   orderBalancePctEntry: number;
   orderBalancePctExit: number;
+}
+
+export interface ExecutionOrderResponse {
+  timestamp: number;
+  marketType: ExecutionMarketType | 'spot';
+  symbol: string;
+  testnet: boolean;
+  exchange?: 'binance' | 'bithumb';
+  dryRun?: boolean;
+  request?: {
+    symbol?: string;
+    side?: 'buy' | 'sell';
+    type?: 'market' | 'limit';
+    amount?: number | null;
+    balancePct?: number | null;
+    price?: number | null;
+    leverage?: number | null;
+    marginMode?: 'isolated' | 'cross' | null;
+    dryRun?: boolean;
+    reduceOnly?: boolean;
+    timeInForce?: string | null;
+    positionSide?: string | null;
+    clientOrderId?: string | null;
+  };
+  retry?: {
+    configuredRetryCount?: number;
+    retryDelayMs?: number;
+    attempt?: number;
+    maxAttempts?: number;
+  };
+  idempotency?: {
+    key: string | null;
+    replayed: boolean;
+  };
+  order?: {
+    id: string | null;
+    clientOrderId?: string | null;
+    status: string | null;
+    symbol: string;
+    type: string | null;
+    side: string | null;
+    amount: number | null;
+    price: number | null;
+    average: number | null;
+    filled: number | null;
+    remaining: number | null;
+    cost: number | null;
+    timestamp: number | null;
+    datetime: string | null;
+    fee?: {
+      currency: string | null;
+      cost: number | null;
+      rate: number | null;
+    } | null;
+  };
+  safety?: ExecutionSafetySummary;
+  error?: string;
 }
 
 export interface TradeLog {

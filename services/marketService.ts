@@ -2,6 +2,7 @@ import {
     AuthSessionResponse,
     BithumbExecutionPortfolioResponse,
     BinanceExecutionFillsResponse,
+    BinanceSpotExecutionPortfolioResponse,
     BithumbExecutionFillsResponse,
     BinanceExecutionPortfolioResponse,
     BinanceExecutionPositionResponse,
@@ -10,6 +11,7 @@ import {
     ExecutionCredentialsStatusResponse,
     ExecutionEngineReadinessResponse,
     ExecutionEngineStatusResponse,
+    ExecutionOrderResponse,
     ExecutionEventsResponse,
     ExecutionMarketType,
     ExecutionSafetyResponse,
@@ -1378,6 +1380,103 @@ function normalizeBithumbExecutionPortfolioResponse(payload: any): BithumbExecut
     };
 }
 
+function normalizeBinanceSpotExecutionPortfolioResponse(payload: any): BinanceSpotExecutionPortfolioResponse {
+    if (
+        !payload ||
+        toFiniteNumber(payload?.timestamp) === null ||
+        typeof payload?.connected !== 'boolean' ||
+        typeof payload?.configured !== 'boolean' ||
+        typeof payload?.symbol !== 'string'
+    ) {
+        throw new Error('Invalid Binance spot execution portfolio payload');
+    }
+
+    const walletBalances = Array.isArray(payload?.walletBalances)
+        ? payload.walletBalances
+            .map((item: any) => {
+                if (!item || typeof item.asset !== 'string') return null;
+                return {
+                    asset: item.asset,
+                    free: item?.free == null ? null : Number(item.free),
+                    used: item?.used == null ? null : Number(item.used),
+                    total: item?.total == null ? null : Number(item.total),
+                };
+            })
+            .filter(
+                (
+                    item
+                ): item is {
+                    asset: string;
+                    free: number | null;
+                    used: number | null;
+                    total: number | null;
+                } => item !== null
+            )
+        : [];
+
+    const positions = Array.isArray(payload?.positions)
+        ? payload.positions
+            .map((item: any) => {
+                if (!item || typeof item?.symbol !== 'string') return null;
+                return {
+                    symbol: item.symbol,
+                    side: typeof item?.side === 'string' ? item.side : null,
+                    contracts: item?.contracts == null ? null : Number(item.contracts),
+                    contractSize: item?.contractSize == null ? null : Number(item.contractSize),
+                    notional: item?.notional == null ? null : Number(item.notional),
+                    leverage: item?.leverage == null ? null : Number(item.leverage),
+                    entryPrice: item?.entryPrice == null ? null : Number(item.entryPrice),
+                    markPrice: item?.markPrice == null ? null : Number(item.markPrice),
+                    unrealizedPnl: item?.unrealizedPnl == null ? null : Number(item.unrealizedPnl),
+                    liquidationPrice:
+                        item?.liquidationPrice == null ? null : Number(item.liquidationPrice),
+                    marginMode: typeof item?.marginMode === 'string' ? item.marginMode : null,
+                };
+            })
+            .filter(
+                (item): item is BinanceSpotExecutionPortfolioResponse['positions'][number] =>
+                    item !== null
+            )
+        : [];
+
+    const summaryPayload =
+        payload?.summary && typeof payload.summary === 'object' ? payload.summary : {};
+
+    return {
+        timestamp: Number(payload.timestamp),
+        connected: Boolean(payload.connected),
+        configured: Boolean(payload.configured),
+        marketType: 'spot',
+        symbol: payload.symbol,
+        testnet: Boolean(payload.testnet),
+        balanceAsset: typeof payload?.balanceAsset === 'string' ? payload.balanceAsset : 'USDT',
+        safety: normalizeExecutionSafetySummary(payload?.safety),
+        walletBalances,
+        positions,
+        summary: {
+            walletAssetFree:
+                summaryPayload?.walletAssetFree == null
+                    ? null
+                    : Number(summaryPayload.walletAssetFree),
+            walletAssetUsed:
+                summaryPayload?.walletAssetUsed == null
+                    ? null
+                    : Number(summaryPayload.walletAssetUsed),
+            walletAssetTotal:
+                summaryPayload?.walletAssetTotal == null
+                    ? null
+                    : Number(summaryPayload.walletAssetTotal),
+            walletBalanceCount: Number(summaryPayload?.walletBalanceCount ?? walletBalances.length),
+            activePositionCount: Number(summaryPayload?.activePositionCount ?? positions.length),
+            totalUnrealizedPnl:
+                summaryPayload?.totalUnrealizedPnl == null
+                    ? null
+                    : Number(summaryPayload.totalUnrealizedPnl),
+        },
+        error: typeof payload?.error === 'string' ? payload.error : undefined,
+    };
+}
+
 function normalizeExecutionFillsResponse(payload: any): BinanceExecutionFillsResponse {
     if (
         !payload ||
@@ -1675,6 +1774,15 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
         : orderBalancePctEntry;
     const lastOrderAmount =
         toFiniteNumber(enginePayload?.lastOrderAmount) ?? null;
+    const binanceEntrySide =
+        enginePayload?.binanceEntrySide === 'long' ? 'long' : 'short';
+    const binanceLeverageRaw = toFiniteNumber(enginePayload?.binanceLeverage);
+    const binanceLeverage =
+        Number.isFinite(binanceLeverageRaw) && binanceLeverageRaw > 0
+            ? Math.floor(binanceLeverageRaw)
+            : 4;
+    const binanceMarginMode =
+        enginePayload?.binanceMarginMode === 'cross' ? 'cross' : 'isolated';
 
     return {
         timestamp: Number(payload.timestamp),
@@ -1684,6 +1792,9 @@ function normalizeExecutionEngineStatusResponse(payload: any): ExecutionEngineSt
             busy: Boolean(enginePayload.busy),
             marketType: normalizeExecutionMarketType(enginePayload.marketType),
             symbol: typeof enginePayload?.symbol === 'string' ? enginePayload.symbol : '',
+            binanceEntrySide,
+            binanceLeverage,
+            binanceMarginMode,
             orderBalancePctEntry,
             orderBalancePctExit,
             dryRun: Boolean(enginePayload?.dryRun),
@@ -1774,6 +1885,126 @@ function normalizeExecutionEngineReadinessResponse(payload: any): ExecutionEngin
         safety: status.safety,
         engine: status.engine,
         checks,
+    };
+}
+
+function normalizeExecutionOrderResponse(payload: any): ExecutionOrderResponse {
+    if (!payload || typeof payload !== 'object') {
+        throw new Error('Invalid execution order payload');
+    }
+
+    const marketType =
+        payload.marketType === 'coinm' || payload.marketType === 'usdm' || payload.marketType === 'spot'
+            ? payload.marketType
+            : 'coinm';
+    const requestPayload = payload?.request && typeof payload.request === 'object' ? payload.request : null;
+    const orderPayload = payload?.order && typeof payload.order === 'object' ? payload.order : null;
+    const retryPayload = payload?.retry && typeof payload.retry === 'object' ? payload.retry : null;
+    const idempotencyPayload =
+        payload?.idempotency && typeof payload.idempotency === 'object' ? payload.idempotency : null;
+    const feePayload = orderPayload?.fee && typeof orderPayload.fee === 'object' ? orderPayload.fee : null;
+
+    return {
+        timestamp: Number(toFiniteNumber(payload.timestamp) ?? Date.now()),
+        marketType,
+        symbol:
+            typeof payload.symbol === 'string'
+                ? payload.symbol
+                : typeof requestPayload?.symbol === 'string'
+                    ? requestPayload.symbol
+                    : '',
+        testnet: Boolean(payload.testnet),
+        exchange: payload.exchange === 'bithumb' ? 'bithumb' : 'binance',
+        dryRun:
+            payload?.dryRun == null
+                ? requestPayload?.dryRun == null
+                    ? undefined
+                    : Boolean(requestPayload.dryRun)
+                : Boolean(payload.dryRun),
+        request: requestPayload
+            ? {
+                symbol: typeof requestPayload.symbol === 'string' ? requestPayload.symbol : undefined,
+                side:
+                    requestPayload.side === 'buy' || requestPayload.side === 'sell'
+                        ? requestPayload.side
+                        : undefined,
+                type:
+                    requestPayload.type === 'market' || requestPayload.type === 'limit'
+                        ? requestPayload.type
+                        : undefined,
+                amount: toFiniteNumber(requestPayload.amount),
+                balancePct: toFiniteNumber(requestPayload.balancePct),
+                price: toFiniteNumber(requestPayload.price),
+                leverage: toFiniteNumber(requestPayload.leverage),
+                marginMode:
+                    requestPayload.marginMode === 'isolated' || requestPayload.marginMode === 'cross'
+                        ? requestPayload.marginMode
+                        : null,
+                dryRun:
+                    requestPayload.dryRun == null ? undefined : Boolean(requestPayload.dryRun),
+                reduceOnly:
+                    requestPayload.reduceOnly == null ? undefined : Boolean(requestPayload.reduceOnly),
+                timeInForce:
+                    typeof requestPayload.timeInForce === 'string'
+                        ? requestPayload.timeInForce
+                        : null,
+                positionSide:
+                    typeof requestPayload.positionSide === 'string'
+                        ? requestPayload.positionSide
+                        : null,
+                clientOrderId:
+                    typeof requestPayload.clientOrderId === 'string'
+                        ? requestPayload.clientOrderId
+                        : null,
+            }
+            : undefined,
+        retry: retryPayload
+            ? {
+                configuredRetryCount: toFiniteNumber(retryPayload.configuredRetryCount) ?? undefined,
+                retryDelayMs: toFiniteNumber(retryPayload.retryDelayMs) ?? undefined,
+                attempt: toFiniteNumber(retryPayload.attempt) ?? undefined,
+                maxAttempts: toFiniteNumber(retryPayload.maxAttempts) ?? undefined,
+            }
+            : undefined,
+        idempotency: idempotencyPayload
+            ? {
+                key: typeof idempotencyPayload.key === 'string' ? idempotencyPayload.key : null,
+                replayed: Boolean(idempotencyPayload.replayed),
+            }
+            : undefined,
+        order: orderPayload
+            ? {
+                id: typeof orderPayload.id === 'string' ? orderPayload.id : null,
+                clientOrderId:
+                    typeof orderPayload.clientOrderId === 'string' ? orderPayload.clientOrderId : null,
+                status: typeof orderPayload.status === 'string' ? orderPayload.status : null,
+                symbol:
+                    typeof orderPayload.symbol === 'string'
+                        ? orderPayload.symbol
+                        : typeof payload.symbol === 'string'
+                            ? payload.symbol
+                            : '',
+                type: typeof orderPayload.type === 'string' ? orderPayload.type : null,
+                side: typeof orderPayload.side === 'string' ? orderPayload.side : null,
+                amount: toFiniteNumber(orderPayload.amount),
+                price: toFiniteNumber(orderPayload.price),
+                average: toFiniteNumber(orderPayload.average),
+                filled: toFiniteNumber(orderPayload.filled),
+                remaining: toFiniteNumber(orderPayload.remaining),
+                cost: toFiniteNumber(orderPayload.cost),
+                timestamp: toFiniteNumber(orderPayload.timestamp),
+                datetime: typeof orderPayload.datetime === 'string' ? orderPayload.datetime : null,
+                fee: feePayload
+                    ? {
+                        currency: typeof feePayload.currency === 'string' ? feePayload.currency : null,
+                        cost: toFiniteNumber(feePayload.cost),
+                        rate: toFiniteNumber(feePayload.rate),
+                    }
+                    : null,
+            }
+            : undefined,
+        safety: payload?.safety,
+        error: typeof payload.error === 'string' ? payload.error : undefined,
     };
 }
 
@@ -1873,6 +2104,22 @@ export const fetchBithumbExecutionPortfolio = async (options: {
         `/api/execution/bithumb/portfolio?${params.toString()}`,
         'Bithumb execution portfolio API',
         normalizeBithumbExecutionPortfolioResponse
+    );
+};
+
+export const fetchBinanceSpotExecutionPortfolio = async (options: {
+    symbol?: string;
+    balanceLimit?: number;
+} = {}): Promise<BinanceSpotExecutionPortfolioResponse> => {
+    const params = new URLSearchParams();
+    if (options.symbol && options.symbol.trim()) params.set('symbol', options.symbol.trim());
+    if (Number.isFinite(options.balanceLimit ?? NaN)) {
+        params.set('balanceLimit', String(options.balanceLimit));
+    }
+    return await fetchApi(
+        `/api/execution/binance/spot/portfolio?${params.toString()}`,
+        'Binance spot execution portfolio API',
+        normalizeBinanceSpotExecutionPortfolioResponse
     );
 };
 
@@ -2061,6 +2308,59 @@ export const stopExecutionEngine = async (
         {
             method: 'POST',
             body: { reason },
+            allowFallback: false,
+        }
+    );
+};
+
+export const placeBinanceExecutionOrder = async (request: {
+    marketType?: ExecutionMarketType;
+    symbol: string;
+    side: 'buy' | 'sell';
+    type?: 'market' | 'limit';
+    amount?: number;
+    balancePct?: number;
+    price?: number;
+    leverage?: number;
+    marginMode?: 'isolated' | 'cross';
+    dryRun?: boolean;
+    allowInSafeMode?: boolean;
+    reduceOnly?: boolean;
+    timeInForce?: string;
+    positionSide?: string;
+    clientOrderId?: string;
+    idempotencyKey?: string;
+}): Promise<ExecutionOrderResponse> => {
+    return await fetchApi(
+        '/api/execution/binance/order',
+        'Binance execution order API',
+        normalizeExecutionOrderResponse,
+        {
+            method: 'POST',
+            body: request,
+            allowFallback: false,
+        }
+    );
+};
+
+export const placeBithumbExecutionOrder = async (request: {
+    symbol: string;
+    side: 'buy' | 'sell';
+    type?: 'market' | 'limit';
+    amount?: number;
+    balancePct?: number;
+    price?: number;
+    dryRun?: boolean;
+    allowInSafeMode?: boolean;
+    idempotencyKey?: string;
+}): Promise<ExecutionOrderResponse> => {
+    return await fetchApi(
+        '/api/execution/bithumb/order',
+        'Bithumb execution order API',
+        normalizeExecutionOrderResponse,
+        {
+            method: 'POST',
+            body: request,
             allowFallback: false,
         }
     );
