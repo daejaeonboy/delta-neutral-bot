@@ -6002,6 +6002,130 @@ function normalizeExecutionWalletBalances(balance, balanceLimit = 8) {
     return rows.slice(0, balanceLimit);
 }
 
+function extractTickerPrice(ticker) {
+    const candidates = [
+        toFiniteNumber(ticker?.last),
+        toFiniteNumber(ticker?.close),
+        toFiniteNumber(ticker?.mark),
+        toFiniteNumber(ticker?.bid),
+        toFiniteNumber(ticker?.ask),
+        toFiniteNumber(ticker?.average),
+    ];
+
+    for (const candidate of candidates) {
+        if (Number.isFinite(candidate) && candidate > 0) {
+            return Number(candidate);
+        }
+    }
+
+    return null;
+}
+
+async function buildBithumbWalletValuations(balance, client, balanceLimit = 8) {
+    const normalizedRows = normalizeExecutionWalletBalances(balance, balanceLimit);
+    const { totalMap } = getExecutionBalanceMaps(balance);
+    const activeAssets = [];
+
+    for (const [asset, totalRaw] of Object.entries(totalMap)) {
+        const total = toFiniteNumber(totalRaw);
+        if (!Number.isFinite(total) || Math.abs(total) <= 1e-12) continue;
+        activeAssets.push({ asset, total: Number(total) });
+    }
+
+    const symbols = [];
+    const assetToSymbol = new Map();
+
+    for (const { asset } of activeAssets) {
+        const normalizedAsset = typeof asset === 'string' ? asset.trim().toUpperCase() : '';
+        if (!normalizedAsset || normalizedAsset === 'KRW') continue;
+
+        const symbol = `${normalizedAsset}/KRW`;
+        if (!client?.markets || !client.markets[symbol]) continue;
+
+        assetToSymbol.set(normalizedAsset, symbol);
+        symbols.push(symbol);
+    }
+
+    let tickers = {};
+    if (symbols.length > 0) {
+        try {
+            tickers = await client.fetchTickers(symbols);
+        } catch (error) {
+            tickers = {};
+            await Promise.all(
+                symbols.map(async (symbol) => {
+                    try {
+                        tickers[symbol] = await client.fetchTicker(symbol);
+                    } catch (tickerError) {
+                        recordRuntimeEvent('warn', 'api_execution_bithumb_portfolio_ticker_failure', {
+                            symbol,
+                            error: toErrorMessage(tickerError),
+                        });
+                    }
+                })
+            );
+        }
+    }
+
+    const krwValueByAsset = new Map();
+
+    for (const { asset, total } of activeAssets) {
+        const normalizedAsset = typeof asset === 'string' ? asset.trim().toUpperCase() : '';
+        if (!normalizedAsset) continue;
+
+        if (normalizedAsset === 'KRW') {
+            krwValueByAsset.set(normalizedAsset, toNullableRounded(total, 4));
+            continue;
+        }
+
+        const symbol = assetToSymbol.get(normalizedAsset);
+        if (!symbol) continue;
+
+        const price = extractTickerPrice(tickers[symbol]);
+        if (!Number.isFinite(price) || price <= 0) continue;
+
+        krwValueByAsset.set(normalizedAsset, toNullableRounded(total * price, 4));
+    }
+
+    const walletBalances = normalizedRows.map((row) => {
+        const normalizedAsset = typeof row?.asset === 'string' ? row.asset.trim().toUpperCase() : '';
+        return {
+            ...row,
+            krwValue: normalizedAsset ? (krwValueByAsset.get(normalizedAsset) ?? null) : null,
+        };
+    });
+
+    let walletEstimatedTotalKrw = 0;
+    let hasEstimatedTotalKrw = false;
+    let walletEstimatedOtherAssetTotalKrw = 0;
+    let hasEstimatedOtherAssetTotalKrw = false;
+
+    for (const [asset, krwValueRaw] of krwValueByAsset.entries()) {
+        const krwValue = toFiniteNumber(krwValueRaw);
+        if (!Number.isFinite(krwValue)) continue;
+
+        walletEstimatedTotalKrw += Number(krwValue);
+        hasEstimatedTotalKrw = true;
+
+        if (asset !== 'KRW' && asset !== 'BTC' && asset !== 'USDT') {
+            walletEstimatedOtherAssetTotalKrw += Number(krwValue);
+            hasEstimatedOtherAssetTotalKrw = true;
+        }
+    }
+
+    return {
+        walletBalances,
+        summary: {
+            walletEstimatedTotalKrw: hasEstimatedTotalKrw
+                ? toNullableRounded(walletEstimatedTotalKrw, 4)
+                : null,
+            walletEstimatedOtherAssetTotalKrw: hasEstimatedOtherAssetTotalKrw
+                ? toNullableRounded(walletEstimatedOtherAssetTotalKrw, 4)
+                : null,
+        },
+    };
+}
+
 function normalizeExecutionPositions(positions) {
     if (!Array.isArray(positions)) return [];
 
@@ -8316,8 +8440,8 @@ app.get('/api/execution/bithumb/portfolio', async (req, res) => {
     try {
         const client = await getBithumbExecutionClient(true);
         const balance = await client.fetchBalance();
-
-        const walletBalances = normalizeExecutionWalletBalances(balance, balanceLimit);
+        const walletValuations = await buildBithumbWalletValuations(balance, client, balanceLimit);
+        const walletBalances = walletValuations.walletBalances;
         const positions = []; // Spot market doesn't have positions in CCXT standard way
         const assetBalance = balance?.[balanceAsset] ?? {};
 
@@ -8336,6 +8460,9 @@ app.get('/api/execution/bithumb/portfolio', async (req, res) => {
                 walletAssetFree: toNullableRounded(assetBalance?.free, 8),
                 walletAssetUsed: toNullableRounded(assetBalance?.used, 8),
                 walletAssetTotal: toNullableRounded(assetBalance?.total, 8),
+                walletEstimatedTotalKrw: walletValuations.summary.walletEstimatedTotalKrw,
+                walletEstimatedOtherAssetTotalKrw:
+                    walletValuations.summary.walletEstimatedOtherAssetTotalKrw,
                 walletBalanceCount: walletBalances.length,
                 activePositionCount: 0,
                 totalUnrealizedPnl: null,

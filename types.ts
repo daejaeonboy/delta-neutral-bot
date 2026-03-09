@@ -394,6 +394,7 @@ export interface BithumbExecutionPortfolioResponse {
     free: number | null;
     used: number | null;
     total: number | null;
+    krwValue?: number | null;
   }>;
   positions: Array<{
     symbol: string;
@@ -412,6 +413,8 @@ export interface BithumbExecutionPortfolioResponse {
     walletAssetFree: number | null;
     walletAssetUsed: number | null;
     walletAssetTotal: number | null;
+    walletEstimatedTotalKrw?: number | null;
+    walletEstimatedOtherAssetTotalKrw?: number | null;
     walletBalanceCount: number;
     activePositionCount: number;
     totalUnrealizedPnl: number | null;

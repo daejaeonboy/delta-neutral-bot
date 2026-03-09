@@ -1437,34 +1437,44 @@ const App: React.FC = () => {
       (hasBinanceSpotCombinedKrw ? Number(binanceSpotCombinedKrw) : 0)
       : null;
   const bithumbBalances = bithumbPortfolio?.walletBalances ?? [];
-  const bithumbKrwAssetTotal =
-    bithumbBalances.find((row) => row.asset.toUpperCase() === 'KRW')?.total ?? null;
-  const bithumbBtcTotal =
-    bithumbBalances.find((row) => row.asset.toUpperCase() === 'BTC')?.total ?? null;
-  const bithumbBtcFree =
-    bithumbBalances.find((row) => row.asset.toUpperCase() === 'BTC')?.free ?? null;
-  const bithumbUsdtTotal =
-    bithumbBalances.find((row) => row.asset.toUpperCase() === 'USDT')?.total ?? null;
+  const bithumbKrwRow = bithumbBalances.find((row) => row.asset.toUpperCase() === 'KRW');
+  const bithumbBtcRow = bithumbBalances.find((row) => row.asset.toUpperCase() === 'BTC');
+  const bithumbUsdtRow = bithumbBalances.find((row) => row.asset.toUpperCase() === 'USDT');
+  const bithumbKrwAssetTotal = bithumbKrwRow?.total ?? null;
+  const bithumbBtcTotal = bithumbBtcRow?.total ?? null;
+  const bithumbBtcFree = bithumbBtcRow?.free ?? null;
+  const bithumbUsdtTotal = bithumbUsdtRow?.total ?? null;
   const bithumbKrwTotal =
     bithumbPortfolioSummary?.walletAssetTotal ??
     bithumbKrwAssetTotal ??
     null;
   const bithumbKrwFree =
     bithumbPortfolioSummary?.walletAssetFree ??
-    (bithumbBalances.find((row) => row.asset.toUpperCase() === 'KRW')?.free ?? null);
+    (bithumbKrwRow?.free ?? null);
   const bithumbBtcKrw =
-    bithumbBtcTotal != null && Number.isFinite(currentData?.krwPrice ?? NaN)
+    bithumbBtcRow?.krwValue != null
+      ? bithumbBtcRow.krwValue
+      : bithumbBtcTotal != null && Number.isFinite(currentData?.krwPrice ?? NaN)
       ? bithumbBtcTotal * (currentData?.krwPrice ?? 0)
       : null;
   const bithumbUsdtKrw =
-    bithumbUsdtTotal != null && Number.isFinite(usdtKrwForPortfolio ?? NaN)
+    bithumbUsdtRow?.krwValue != null
+      ? bithumbUsdtRow.krwValue
+      : bithumbUsdtTotal != null && Number.isFinite(usdtKrwForPortfolio ?? NaN)
       ? bithumbUsdtTotal * (usdtKrwForPortfolio ?? 0)
       : null;
+  const bithumbOtherAssetKrw =
+    bithumbPortfolioSummary?.walletEstimatedOtherAssetTotalKrw ?? null;
   const hasBithumbKrwCash = Number.isFinite(bithumbKrwTotal ?? NaN);
   const hasBithumbBtcKrw = Number.isFinite(bithumbBtcKrw ?? NaN);
   const hasBithumbUsdtKrw = Number.isFinite(bithumbUsdtKrw ?? NaN);
+  const hasBithumbEstimatedTotalKrw = Number.isFinite(
+    bithumbPortfolioSummary?.walletEstimatedTotalKrw ?? NaN
+  );
   const bithumbCombinedKrw =
-    hasBithumbKrwCash || hasBithumbBtcKrw || hasBithumbUsdtKrw
+    hasBithumbEstimatedTotalKrw
+      ? Number(bithumbPortfolioSummary?.walletEstimatedTotalKrw)
+      : hasBithumbKrwCash || hasBithumbBtcKrw || hasBithumbUsdtKrw
       ? (hasBithumbKrwCash ? Number(bithumbKrwTotal) : 0) +
       (hasBithumbBtcKrw ? Number(bithumbBtcKrw) : 0) +
       (hasBithumbUsdtKrw ? Number(bithumbUsdtKrw) : 0)
@@ -3413,7 +3423,7 @@ const App: React.FC = () => {
                               <div className="text-slate-500 text-[10px]">총 보유 (KRW 환산)</div>
                               <div className="text-slate-200 font-mono text-base mt-1">₩{formatNullableNumber(bithumbCombinedKrw, 0)}</div>
                               <div className="text-slate-500 mt-1">
-                                KRW ₩{formatNullableNumber(bithumbKrwTotal, 0)} · BTC ₩{formatNullableNumber(bithumbBtcKrw, 0)} · USDT ₩{formatNullableNumber(bithumbUsdtKrw, 0)}
+                                KRW ₩{formatNullableNumber(bithumbKrwTotal, 0)} · BTC ₩{formatNullableNumber(bithumbBtcKrw, 0)} · USDT ₩{formatNullableNumber(bithumbUsdtKrw, 0)} · 기타 ₩{formatNullableNumber(bithumbOtherAssetKrw, 0)}
                               </div>
                             </div>
                             <div className="rounded border border-slate-800 bg-slate-900/50 px-3 py-2">
@@ -3435,6 +3445,7 @@ const App: React.FC = () => {
                                 <thead>
                                   <tr className="text-slate-500 border-b border-slate-800">
                                     <th className="py-2 px-3 text-left">자산</th>
+                                    <th className="py-2 px-3 text-right">KRW 환산</th>
                                     <th className="py-2 px-3 text-right">총</th>
                                     <th className="py-2 px-3 text-right">가용</th>
                                     <th className="py-2 px-3 text-right">사용</th>
@@ -3443,7 +3454,7 @@ const App: React.FC = () => {
                                 <tbody>
                                   {(bithumbPortfolio?.walletBalances ?? []).length === 0 ? (
                                     <tr>
-                                      <td colSpan={4} className="py-4 text-center text-slate-500">
+                                      <td colSpan={5} className="py-4 text-center text-slate-500">
                                         표시할 빗썸 잔고가 없습니다.
                                       </td>
                                     </tr>
@@ -3451,6 +3462,7 @@ const App: React.FC = () => {
                                     (bithumbPortfolio?.walletBalances ?? []).map((item) => (
                                       <tr key={`b-${item.asset}`} className="border-b border-slate-900/70">
                                         <td className="py-2 px-3 text-slate-300 font-medium">{item.asset}</td>
+                                        <td className="py-2 px-3 text-right text-slate-300 font-mono">₩{formatNullableNumber(item.krwValue, 0)}</td>
                                         <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.total, 8)}</td>
                                         <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.free, 8)}</td>
                                         <td className="py-2 px-3 text-right text-slate-300 font-mono">{formatNullableNumber(item.used, 8)}</td>

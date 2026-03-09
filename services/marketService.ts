@@ -1322,6 +1322,7 @@ function normalizeBithumbExecutionPortfolioResponse(payload: any): BithumbExecut
                 free: item?.free == null ? null : Number(item.free),
                 used: item?.used == null ? null : Number(item.used),
                 total: item?.total == null ? null : Number(item.total),
+                krwValue: item?.krwValue == null ? null : Number(item.krwValue),
             };
         })
         .filter(
@@ -1369,6 +1370,14 @@ function normalizeBithumbExecutionPortfolioResponse(payload: any): BithumbExecut
                 summaryPayload?.walletAssetUsed == null ? null : Number(summaryPayload.walletAssetUsed),
             walletAssetTotal:
                 summaryPayload?.walletAssetTotal == null ? null : Number(summaryPayload.walletAssetTotal),
+            walletEstimatedTotalKrw:
+                summaryPayload?.walletEstimatedTotalKrw == null
+                    ? null
+                    : Number(summaryPayload.walletEstimatedTotalKrw),
+            walletEstimatedOtherAssetTotalKrw:
+                summaryPayload?.walletEstimatedOtherAssetTotalKrw == null
+                    ? null
+                    : Number(summaryPayload.walletEstimatedOtherAssetTotalKrw),
             walletBalanceCount: Number(summaryPayload?.walletBalanceCount ?? walletBalances.length),
             activePositionCount: Number(summaryPayload?.activePositionCount ?? positions.length),
             totalUnrealizedPnl:
